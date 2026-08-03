@@ -1,0 +1,42 @@
+{
+  "name": "trace-replay-platform",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "npm run build:server && npm run typecheck:client && npm run build:client",
+    "build:server": "tsc -p tsconfig.server.json",
+    "typecheck:client": "tsc -p tsconfig.client.json",
+    "build:client": "vite build",
+    "start": "node dist/server/index.js",
+    "dev": "tsx src/server/index.ts",
+    "test": "tsx --test test/*.test.ts",
+    "e2e": "playwright test",
+    "postinstall": "playwright install chromium"
+  },
+  "dependencies": {
+    "@react-three/drei": "^9.114.0",
+    "@react-three/fiber": "^8.17.10",
+    "better-sqlite3": "11.10.0",
+    "react": "18.3.1",
+    "react-dom": "18.3.1",
+    "three": "0.169.0",
+    "ws": "8.18.0"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.47.2",
+    "@types/better-sqlite3": "7.6.11",
+    "@types/node": "20.16.5",
+    "@types/react": "18.3.5",
+    "@types/react-dom": "18.3.0",
+    "@types/three": "0.169.0",
+    "@types/ws": "8.5.12",
+    "@vitejs/plugin-react": "4.3.1",
+    "tsx": "4.19.1",
+    "typescript": "5.5.4",
+    "vite": "5.4.8"
+  }
+}

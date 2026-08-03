@@ -1,0 +1,7 @@
+node_modules/
+dist/
+data/
+e2e/.tmp/
+test-results/
+playwright-report/
+*.local

@@ -1,0 +1,31 @@
+{
+  "name": "trace-replay-platform",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "shared",
+    "server",
+    "web",
+    "sample"
+  ],
+  "scripts": {
+    "build": "npm run build -w @replay/shared && npm run build -w @replay/server && npm run build -w @replay/sample && npm run build -w @replay/web",
+    "test": "vitest run",
+    "e2e": "npm run build && playwright install chromium && playwright test",
+    "start": "node server/dist/index.js",
+    "sample": "node --import tsx sample/src/stream.ts",
+    "dev:server": "node --import tsx server/src/index.ts",
+    "dev:web": "npm run dev -w @replay/web"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.48.2",
+    "@types/node": "^20.16.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.6.3",
+    "vitest": "^2.1.4"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

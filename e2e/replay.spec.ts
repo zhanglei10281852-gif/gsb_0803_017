@@ -198,10 +198,103 @@ test("暂停期间迟到事件可见提示，可一键吸收到游标", async ({
   await expect(page.getByTestId("ingest-readout")).toHaveText(`${headSeq + 2} / ${headSeq + 2}`);
 });
 
-test("窄屏布局：tabs 切换完成选择、回放与游标操作", async ({ page }) => {
-  await page.setViewportSize({ width: 480, height: 900 });
+test("事故快照：封存 A/B 游标、差异与备注、迟到不改写已封存结果", async ({ page }) => {
   // 前一个用例已注入 2 条探针事件
   await waitAppReady(page, expectations.head.totalEntries + 2);
+  const { r2 } = await incidentSeqs();
+
+  await page.getByTestId("mode-toggle").click();
+  await page.getByTestId("snapshot-toggle").click();
+
+  // A：迟到修订 r2 生效之前；B：r2 生效之后
+  await page.getByTestId("ingest-slider").fill(String(r2 - 1));
+  await page.getByTestId("seal-a-btn").click();
+  await expect(page.getByTestId("seal-readout")).toContainText(`ingest=${r2 - 1}`);
+  await page.getByTestId("ingest-slider").fill(String(r2));
+  await page.getByTestId("seal-b-btn").click();
+
+  await page.getByTestId("seal-create-btn").click();
+  await expect(page.getByTestId("seal-msg")).toContainText("已封存 snap-");
+  const items = page.locator('[data-testid^="snapshot-item-"]');
+  await expect(items).toHaveCount(1);
+
+  // 差异摘要：恰好 1 个 span 变化（状态翻转）+ 1 条边变化 + 1 条错误路径变化
+  await expect(page.getByTestId("diff-summary")).toContainText("变化 1");
+  await expect(page.getByTestId("diff-summary")).toContainText("状态翻转 1");
+  await expect(page.getByTestId("diff-summary")).toContainText("错误路径 1");
+
+  // 详情：digest、高水位、复核一致
+  const testid = (await items.first().getAttribute("data-testid")) ?? "";
+  const snapshotId = testid.replace("snapshot-item-", "");
+  expect(snapshotId).toMatch(/^snap-[0-9a-f]{16}$/);
+  await expect(page.getByTestId("snapshot-digest")).toBeVisible();
+  await expect(page.getByTestId("snapshot-highwater")).toContainText("entries=");
+  await page.getByTestId("verify-btn").click();
+  await expect(page.getByTestId("verify-result")).toContainText("一致");
+
+  // span 变化行可联动主界面选择（同一套选择同步，而非旁路）
+  const spanChange = page.locator('[data-testid^="span-change-"]');
+  await expect(spanChange).toHaveCount(1);
+  await spanChange.first().click();
+  const selection = await page.evaluate(
+    () => (window as unknown as { __replay?: ReplayHook }).__replay?.store.getSnapshot().selection,
+  );
+  expect(selection?.spanId).toBeTruthy();
+  await expect(page.getByTestId("details")).toContainText(String(selection?.spanId));
+
+  // 调查备注：追加并展示
+  await page.getByTestId("note-author").fill("值班-张");
+  await page.getByTestId("note-input").fill("payments r2 为迟到修订，确认告警延迟根因");
+  await page.getByTestId("note-submit").click();
+  await expect(page.locator('[data-testid^="note-item-"]')).toHaveCount(1);
+
+  // 相同游标重复封存：幂等，不产生新快照
+  await page.getByTestId("seal-create-btn").click();
+  await expect(page.getByTestId("seal-msg")).toContainText("已存在相同快照");
+  await expect(page.locator('[data-testid^="snapshot-item-"]')).toHaveCount(1);
+
+  // 迟到事件写入过去时点：已封存摘要不变（API 复核），新游标才能产生新快照
+  const lateProbe = {
+    contract: "span-event/1",
+    producerId: "e2e-probe",
+    eventId: "p-late-2",
+    traceId: "tr-probe",
+    spanId: "sp-probe-late2",
+    parentSpanId: null,
+    service: "probe",
+    operation: "late-again",
+    eventTime: expectations.baseTimeMs + 120_000,
+    durationMs: 5,
+    revision: 1,
+    status: "ok",
+    errorMessage: null,
+    attributes: {},
+  };
+  const res = await fetch(`${BASE}/api/ingest`, {
+    method: "POST",
+    headers: { "content-type": "application/x-ndjson" },
+    body: JSON.stringify(lateProbe) + "\n",
+  });
+  expect(res.ok).toBe(true);
+  const verify = (await (
+    await fetch(`${BASE}/api/snapshots/${snapshotId}/verify`)
+  ).json()) as { match: boolean; digest: string; checkedEntries: number };
+  expect(verify.match).toBe(true);
+  expect(verify.checkedEntries).toBe(expectations.head.totalEntries + 3);
+
+  // 推进 B 的 ingest 坐标到头 → 新快照（先等客户端经 WS 收到探针、head 刷新）
+  const headSeq = expectations.head.cursor.ingestSequence + 3;
+  await expect(page.getByTestId("ingest-readout")).toContainText(`/ ${headSeq}`);
+  await page.getByTestId("ingest-slider").fill(String(headSeq));
+  await page.getByTestId("seal-b-btn").click();
+  await page.getByTestId("seal-create-btn").click();
+  await expect(page.locator('[data-testid^="snapshot-item-"]')).toHaveCount(2);
+});
+
+test("窄屏布局：tabs 切换完成选择、回放与游标操作", async ({ page }) => {
+  await page.setViewportSize({ width: 480, height: 900 });
+  // 前面用例已注入 3 条探针事件
+  await waitAppReady(page, expectations.head.totalEntries + 3);
 
   await page.getByTestId("mode-toggle").click();
   await expect(page.getByTestId("mode-chip")).toHaveText("暂停回放");

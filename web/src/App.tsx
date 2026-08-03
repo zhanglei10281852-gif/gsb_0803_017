@@ -7,6 +7,7 @@ import {
 } from "@replay/shared";
 import { SpanDetails } from "./components/SpanDetails.js";
 import { SpanList } from "./components/SpanList.js";
+import { SnapshotPanel } from "./components/SnapshotPanel.js";
 import { Timeline } from "./components/Timeline.js";
 import { TopBar } from "./components/TopBar.js";
 import { Topology3D } from "./components/Topology3D.js";
@@ -109,6 +110,7 @@ export default function App(): React.JSX.Element {
 
   const isNarrow = useMediaQuery("(max-width: 920px)");
   const [sideTab, setSideTab] = useState<"list" | "details">("list");
+  const [drawerOpen, setDrawerOpen] = useState(false);
 
   useEffect(() => {
     if (snap.selection && isNarrow) setSideTab("details");
@@ -130,7 +132,7 @@ export default function App(): React.JSX.Element {
 
   return (
     <div className="app">
-      <TopBar snap={snap} view={view} />
+      <TopBar snap={snap} view={view} onToggleSnapshots={() => setDrawerOpen((v) => !v)} />
       <main className={`main${isNarrow ? " narrow" : ""}`}>
         <section className="panel topo-panel">
           <Topology3D
@@ -183,6 +185,16 @@ export default function App(): React.JSX.Element {
         onSetIngest={(n) => store.setIngestCursor(n)}
         onToggleMode={() => (snap.mode === "live" ? store.pause() : store.resumeLive())}
         onAbsorb={() => store.absorbLatest()}
+      />
+      <SnapshotPanel
+        open={drawerOpen}
+        snap={snap}
+        store={store}
+        onClose={() => setDrawerOpen(false)}
+        onSelectSpan={(traceId, spanId) => {
+          store.select({ traceId, spanId });
+          if (isNarrow) setSideTab("details");
+        }}
       />
     </div>
   );

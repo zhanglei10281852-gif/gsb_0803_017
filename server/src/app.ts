@@ -5,12 +5,16 @@ import express, { type Express, type Request, type Response } from "express";
 import {
   buildView,
   explainSpanVersions,
+  parseNoteInput,
+  parseSealRequest,
   parseSpanEventLine,
   CONTRACT_VERSION,
   type IngestBatchResultV1,
   type ReplayCursorV1,
+  type SealResponseV1,
   type SpanEventV1,
 } from "@replay/shared";
+import { computeSnapshot, verifySnapshot } from "./snapshot.js";
 import type { ReplayStore } from "./store.js";
 
 export interface AppDeps {
@@ -135,6 +139,64 @@ export function createApp(deps: AppDeps): Express {
       match: before === rebuilt.checksum,
       rows: rebuilt.rows,
     });
+  });
+
+  /* ---------- IncidentSnapshot：封存 / 查询 / 备注 / 复核 ---------- */
+
+  // 封存幂等：相同账本与游标 → 相同 digest → 返回已存在快照，不重复写入。
+  app.post("/api/snapshots", express.json({ limit: "1mb" }), (req, res) => {
+    const parsed = parseSealRequest(req.body as unknown);
+    if (!parsed.ok) {
+      res.status(400).json({ error: parsed.error });
+      return;
+    }
+    const { cursorA, cursorB, label } = parsed.value;
+    const computed = computeSnapshot(store, cursorA, cursorB, label);
+    const { existing } = store.saveSnapshot(computed);
+    const stored = store.getSnapshot(computed.id) ?? computed;
+    const result: SealResponseV1 = { contract: "seal-response/1", snapshot: stored, existing };
+    res.status(existing ? 200 : 201).json(result);
+  });
+
+  app.get("/api/snapshots", (_req, res) => {
+    res.json({ contract: "snapshot-list/1", items: store.listSnapshots() });
+  });
+
+  app.get("/api/snapshots/:id", (req, res) => {
+    const snapshot = store.getSnapshot(req.params.id);
+    if (!snapshot) {
+      res.status(404).json({ error: "快照不存在" });
+      return;
+    }
+    res.json({
+      contract: "snapshot-detail/1",
+      snapshot,
+      verify: verifySnapshot(store, snapshot),
+    });
+  });
+
+  app.get("/api/snapshots/:id/verify", (req, res) => {
+    const snapshot = store.getSnapshot(req.params.id);
+    if (!snapshot) {
+      res.status(404).json({ error: "快照不存在" });
+      return;
+    }
+    res.json(verifySnapshot(store, snapshot));
+  });
+
+  // 备注只追加，不修改封存内容，也不影响 digest。
+  app.post("/api/snapshots/:id/notes", express.json({ limit: "64kb" }), (req, res) => {
+    const parsed = parseNoteInput(req.body as unknown);
+    if (!parsed.ok) {
+      res.status(400).json({ error: parsed.error });
+      return;
+    }
+    const note = store.addNote(req.params.id, parsed.value.author, parsed.value.text);
+    if (!note) {
+      res.status(404).json({ error: "快照不存在" });
+      return;
+    }
+    res.status(201).json(note);
   });
 
   if (fs.existsSync(webDist)) {

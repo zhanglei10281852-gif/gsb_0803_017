@@ -5,6 +5,7 @@ import type { Snapshot } from "../state.js";
 export interface TopBarProps {
   snap: Snapshot;
   view: ReplayViewV1;
+  onToggleSnapshots(): void;
 }
 
 const CONNECTION_LABEL: Record<Snapshot["connection"], string> = {
@@ -13,7 +14,7 @@ const CONNECTION_LABEL: Record<Snapshot["connection"], string> = {
   reconnecting: "重连中",
 };
 
-export function TopBar({ snap, view }: TopBarProps): React.JSX.Element {
+export function TopBar({ snap, view, onToggleSnapshots }: TopBarProps): React.JSX.Element {
   return (
     <header className="topbar">
       <div className="topbar-title">链路事故回放平台</div>
@@ -23,6 +24,15 @@ export function TopBar({ snap, view }: TopBarProps): React.JSX.Element {
       <span className={`chip mode-${snap.mode}`} data-testid="mode-chip">
         {snap.mode === "live" ? "实时跟随" : "暂停回放"}
       </span>
+      <button type="button" className="btn" data-testid="snapshot-toggle" onClick={onToggleSnapshots}>
+        快照对比
+      </button>
+      {(snap.sealA || snap.sealB) && (
+        <span className="mono seal-indicator" data-testid="seal-indicator">
+          {snap.sealA ? `A:N=${snap.sealA.ingestSequence} ` : ""}
+          {snap.sealB ? `B:N=${snap.sealB.ingestSequence}` : ""}
+        </span>
+      )}
       <span className="topbar-stat" data-testid="totals">
         账本 {snap.totalEntries} 条 · 服务 {view.services.length} 个 · 游标处可见 span {view.totals.visibleSpans}（错误 {view.totals.errorSpans}）
       </span>

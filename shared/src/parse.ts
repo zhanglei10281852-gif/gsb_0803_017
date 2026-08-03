@@ -5,6 +5,7 @@
 import type {
   LedgerEntryV1,
   ReplayCursorV1,
+  SealRequestV1,
   SpanEventV1,
   SpanStatus,
   WsServerMessageV1,
@@ -160,4 +161,39 @@ export function parseWsServerMessage(input: unknown): ParseResult<WsServerMessag
     return ok({ contract: "ws/1", kind: "live", head: head.value });
   }
   return fail(`未知 kind：${String(kind)}`);
+}
+
+export function parseSealRequest(input: unknown): ParseResult<SealRequestV1> {
+  if (!isRecord(input)) return fail("封存请求不是 JSON 对象");
+  if (input.contract !== "seal-request/1") return fail(`未知 contract：${String(input.contract)}`);
+  const cursorA = parseCursor(input.cursorA);
+  if (!cursorA.ok) return fail(`cursorA 非法：${cursorA.error}`);
+  const cursorB = parseCursor(input.cursorB);
+  if (!cursorB.ok) return fail(`cursorB 非法：${cursorB.error}`);
+  const rawLabel = input.label;
+  let label: string | null = null;
+  if (rawLabel !== undefined && rawLabel !== null) {
+    if (typeof rawLabel !== "string") return fail("label 必须为 string 或 null");
+    label = rawLabel.slice(0, 200);
+  }
+  return ok({ contract: "seal-request/1", cursorA: cursorA.value, cursorB: cursorB.value, label });
+}
+
+export interface NoteInput {
+  author: string;
+  text: string;
+}
+
+export function parseNoteInput(input: unknown): ParseResult<NoteInput> {
+  if (!isRecord(input)) return fail("备注请求不是 JSON 对象");
+  const rawAuthor = input.author;
+  let author = "值班";
+  if (rawAuthor !== undefined && rawAuthor !== null) {
+    if (typeof rawAuthor !== "string" || rawAuthor.trim().length === 0) return fail("author 非法");
+    author = rawAuthor.trim().slice(0, 40);
+  }
+  const rawText = input.text;
+  if (typeof rawText !== "string" || rawText.trim().length === 0) return fail("text 不能为空");
+  if (rawText.length > 2000) return fail("text 超长（<=2000）");
+  return ok({ author, text: rawText.trim() });
 }

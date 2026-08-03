@@ -1,8 +1,18 @@
 import fs from "node:fs";
 import path from "node:path";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import Database from "better-sqlite3";
-import { parseSpanEvent, type LedgerEntryV1, type ReplayCursorV1, type SpanEventV1, type IngestReceiptV1 } from "@replay/shared";
+import {
+  parseSpanEvent,
+  type IncidentSnapshotV1,
+  type LedgerEntryV1,
+  type ReplayCursorV1,
+  type SnapshotDiffV1,
+  type SnapshotListItemV1,
+  type SnapshotNoteV1,
+  type SpanEventV1,
+  type IngestReceiptV1,
+} from "@replay/shared";
 
 export interface HeadInfo {
   cursor: ReplayCursorV1;
@@ -74,6 +84,25 @@ export class ReplayStore {
         status TEXT NOT NULL,
         PRIMARY KEY (trace_id, span_id)
       );
+      CREATE TABLE IF NOT EXISTS snapshots (
+        id TEXT PRIMARY KEY,
+        created_at_ms INTEGER NOT NULL,
+        label TEXT,
+        cursor_a TEXT NOT NULL,
+        cursor_b TEXT NOT NULL,
+        high_water TEXT NOT NULL,
+        digest TEXT NOT NULL UNIQUE,
+        diff_json TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS snapshot_notes (
+        note_id TEXT PRIMARY KEY,
+        snapshot_id TEXT NOT NULL,
+        created_at_ms INTEGER NOT NULL,
+        author TEXT NOT NULL,
+        text TEXT NOT NULL,
+        FOREIGN KEY (snapshot_id) REFERENCES snapshots(id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_notes_snapshot ON snapshot_notes(snapshot_id);
       INSERT OR IGNORE INTO meta(key, value) VALUES ('schema_version', '1');
     `);
   }
@@ -273,5 +302,111 @@ export class ReplayStore {
 
   close(): void {
     this.db.close();
+  }
+
+  /* ---------- IncidentSnapshot：追加式、不可改写的封存结果 ---------- */
+
+  saveSnapshot(s: IncidentSnapshotV1): { existing: boolean } {
+    const res = this.db
+      .prepare(
+        `INSERT OR IGNORE INTO snapshots (id, created_at_ms, label, cursor_a, cursor_b, high_water, digest, diff_json)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        s.id,
+        s.createdAtMs,
+        s.label,
+        JSON.stringify(s.cursorA),
+        JSON.stringify(s.cursorB),
+        JSON.stringify(s.highWater),
+        s.digest,
+        JSON.stringify(s.diff),
+      );
+    return { existing: res.changes === 0 };
+  }
+
+  getSnapshot(id: string): IncidentSnapshotV1 | null {
+    const row = this.db
+      .prepare("SELECT id, created_at_ms, label, cursor_a, cursor_b, high_water, digest, diff_json FROM snapshots WHERE id = ?")
+      .get(id) as
+      | {
+          id: string;
+          created_at_ms: number;
+          label: string | null;
+          cursor_a: string;
+          cursor_b: string;
+          high_water: string;
+          digest: string;
+          diff_json: string;
+        }
+      | undefined;
+    if (!row) return null;
+    const notes = this.db
+      .prepare("SELECT note_id, created_at_ms, author, text FROM snapshot_notes WHERE snapshot_id = ? ORDER BY created_at_ms ASC, rowid ASC")
+      .all(id) as Array<{ note_id: string; created_at_ms: number; author: string; text: string }>;
+    return {
+      contract: "incident-snapshot/1",
+      id: row.id,
+      label: row.label,
+      cursorA: JSON.parse(row.cursor_a) as ReplayCursorV1,
+      cursorB: JSON.parse(row.cursor_b) as ReplayCursorV1,
+      highWater: JSON.parse(row.high_water) as IncidentSnapshotV1["highWater"],
+      digest: row.digest,
+      createdAtMs: row.created_at_ms,
+      diff: JSON.parse(row.diff_json) as SnapshotDiffV1,
+      notes: notes.map((n) => ({
+        contract: "snapshot-note/1",
+        noteId: n.note_id,
+        createdAtMs: n.created_at_ms,
+        author: n.author,
+        text: n.text,
+      })),
+    };
+  }
+
+  listSnapshots(): SnapshotListItemV1[] {
+    const rows = this.db
+      .prepare(
+        `SELECT s.id, s.label, s.cursor_a, s.cursor_b, s.digest, s.created_at_ms, s.diff_json,
+                (SELECT COUNT(*) FROM snapshot_notes n WHERE n.snapshot_id = s.id) AS note_count
+         FROM snapshots s ORDER BY s.created_at_ms DESC, s.id DESC`,
+      )
+      .all() as Array<{
+      id: string;
+      label: string | null;
+      cursor_a: string;
+      cursor_b: string;
+      digest: string;
+      created_at_ms: number;
+      diff_json: string;
+      note_count: number;
+    }>;
+    return rows.map((r) => ({
+      contract: "snapshot-item/1",
+      id: r.id,
+      label: r.label,
+      cursorA: JSON.parse(r.cursor_a) as ReplayCursorV1,
+      cursorB: JSON.parse(r.cursor_b) as ReplayCursorV1,
+      digest: r.digest,
+      createdAtMs: r.created_at_ms,
+      noteCount: r.note_count,
+      summary: (JSON.parse(r.diff_json) as SnapshotDiffV1).summary,
+    }));
+  }
+
+  addNote(snapshotId: string, author: string, text: string): SnapshotNoteV1 | null {
+    const exists = this.db.prepare("SELECT 1 AS x FROM snapshots WHERE id = ?").get(snapshotId);
+    if (!exists) return null;
+    const note: SnapshotNoteV1 = {
+      contract: "snapshot-note/1",
+      noteId: `note-${randomUUID()}`,
+      createdAtMs: Date.now(),
+      author,
+      text,
+    };
+    this.db
+      .prepare("INSERT INTO snapshot_notes (note_id, snapshot_id, created_at_ms, author, text) VALUES (?, ?, ?, ?, ?)")
+      .run(note.noteId, snapshotId, note.createdAtMs, note.author, note.text);
+    return note;
   }
 }

@@ -21,6 +21,8 @@ export interface Snapshot {
   serviceFilter: string | null;
   domainMin: number;
   domainMax: number;
+  sealA: ReplayCursorV1 | null;
+  sealB: ReplayCursorV1 | null;
 }
 
 /**
@@ -42,6 +44,8 @@ export class ReplayStore {
   private totalEntries = 0;
   private selection: Selection | null = null;
   private serviceFilter: string | null = null;
+  private sealA: ReplayCursorV1 | null = null;
+  private sealB: ReplayCursorV1 | null = null;
   private domainMin = 0;
   private domainMax = 0;
   private version = 0;
@@ -58,6 +62,8 @@ export class ReplayStore {
       totalEntries: this.totalEntries,
       selection: this.selection,
       serviceFilter: this.serviceFilter,
+      sealA: this.sealA,
+      sealB: this.sealB,
       domainMin: this.domainMin,
       domainMax: this.domainMax,
     };
@@ -164,6 +170,21 @@ export class ReplayStore {
 
   select(sel: Selection | null): void {
     this.selection = sel;
+    this.changed();
+  }
+
+  /** 把当前游标固定为对比点（实时模式下先暂停，保证 ingest 坐标被钉住）。 */
+  setSealPoint(which: "A" | "B"): void {
+    if (this.mode === "live") this.pause();
+    const point = this.cursor;
+    if (which === "A") this.sealA = point;
+    else this.sealB = point;
+    this.changed();
+  }
+
+  clearSealPoints(): void {
+    this.sealA = null;
+    this.sealB = null;
     this.changed();
   }
 

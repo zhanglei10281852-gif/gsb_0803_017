@@ -211,6 +211,18 @@ export const SealSnapshotRequest = z.object({
   label: z.string().min(1),
   note: z.string().nullable().default(null),
   cursor: ReplayCursor,
+  /**
+   * Optional collaboration credential. When present, the seal is gated by the
+   * session lease + fencing token: only the current valid holder may seal.
+   * Absent means a solo seal outside any shared session (unchanged behaviour).
+   */
+  writer: z
+    .object({
+      sessionId: z.number().int().positive(),
+      holder: z.string().min(1),
+      fencingToken: z.number().int().positive(),
+    })
+    .optional(),
 });
 export type SealSnapshotRequest = z.infer<typeof SealSnapshotRequest>;
 
@@ -259,3 +271,134 @@ export const SnapshotComparison = z.object({
   }),
 });
 export type SnapshotComparison = z.infer<typeof SnapshotComparison>;
+
+// ---------------------------------------------------------------------------
+// Cross-shift collaboration: shared session, lease + fencing, merged notes.
+// Anchored to an immutable IncidentSnapshot; NOT a general accounts/ACL system.
+// ---------------------------------------------------------------------------
+
+/**
+ * A time-bounded write lease. Exactly one holder at a time may seal new
+ * snapshots or advance the shared cursor. `fencingToken` is a persisted,
+ * strictly increasing integer minted on every (re)grant/takeover — a late
+ * client carrying an older token is rejected even if its request arrives after
+ * a newer owner took over.
+ */
+export const CollaborationLease = z.object({
+  holder: z.string().min(1),
+  fencingToken: z.number().int().positive(),
+  expiresAtMs: z.number().int().nonnegative(),
+});
+export type CollaborationLease = z.infer<typeof CollaborationLease>;
+
+/** An investigation note. Concurrent notes are merged deterministically. */
+export const InvestigationNote = z.object({
+  /** Stable client-generated id; re-sending the same id is idempotent. */
+  id: z.string().min(1),
+  author: z.string().min(1),
+  /** Client logical (Lamport) clock, giving a deterministic merge order. */
+  lamport: z.number().int().nonnegative(),
+  body: z.string().min(1),
+  /** Diagnostic wall-clock; never affects merge order or convergence. */
+  createdAtMs: z.number().int().nonnegative(),
+});
+export type InvestigationNote = z.infer<typeof InvestigationNote>;
+
+/** The immutable handoff anchor: which sealed snapshot the session is pinned to. */
+export const SessionAnchor = z.object({
+  id: z.number().int().positive(),
+  label: z.string().min(1),
+  anchorSnapshotId: z.number().int().positive(),
+  /** Must equal the sealed snapshot's digest; proves a shared, verified anchor. */
+  anchorDigest: z.string().min(1),
+  createdAtMs: z.number().int().nonnegative(),
+});
+export type SessionAnchor = z.infer<typeof SessionAnchor>;
+
+/** The full, persisted, reconnect-safe state of a collaboration session. */
+export const SessionState = z.object({
+  contractVersion: z.literal(CONTRACT_VERSION),
+  session: SessionAnchor,
+  /** Current lease, or null when nobody holds one right now. */
+  lease: CollaborationLease.nullable(),
+  /** Highest fencing token ever minted; monotonic across release and restart. */
+  highestFencingToken: z.number().int().nonnegative(),
+  /** The shared cursor the owner drives; followers track it. */
+  sharedCursor: ReplayCursor,
+  /** Fencing token that last advanced the shared cursor (0 = initial anchor). */
+  sharedCursorToken: z.number().int().nonnegative(),
+  /** Deterministically merged notes (union, ordered by lamport/author/id). */
+  notes: z.array(InvestigationNote),
+});
+export type SessionState = z.infer<typeof SessionState>;
+
+/** The write credential a client must present to seal/advance under a session. */
+export const WriterCredential = z.object({
+  sessionId: z.number().int().positive(),
+  holder: z.string().min(1),
+  fencingToken: z.number().int().positive(),
+});
+export type WriterCredential = z.infer<typeof WriterCredential>;
+
+export const CreateSessionRequest = z.object({
+  label: z.string().min(1),
+  anchorSnapshotId: z.number().int().positive(),
+  anchorDigest: z.string().min(1),
+});
+export type CreateSessionRequest = z.infer<typeof CreateSessionRequest>;
+
+export const AcquireLeaseRequest = z.object({
+  holder: z.string().min(1),
+  ttlMs: z.number().int().positive().optional(),
+});
+export type AcquireLeaseRequest = z.infer<typeof AcquireLeaseRequest>;
+
+export const RenewLeaseRequest = z.object({
+  holder: z.string().min(1),
+  fencingToken: z.number().int().positive(),
+  ttlMs: z.number().int().positive().optional(),
+});
+export type RenewLeaseRequest = z.infer<typeof RenewLeaseRequest>;
+
+export const ReleaseLeaseRequest = z.object({
+  holder: z.string().min(1),
+  fencingToken: z.number().int().positive(),
+});
+export type ReleaseLeaseRequest = z.infer<typeof ReleaseLeaseRequest>;
+
+export const AdvanceCursorRequest = z.object({
+  holder: z.string().min(1),
+  fencingToken: z.number().int().positive(),
+  cursor: ReplayCursor,
+});
+export type AdvanceCursorRequest = z.infer<typeof AdvanceCursorRequest>;
+
+export const AddNoteRequest = z.object({
+  note: InvestigationNote,
+});
+export type AddNoteRequest = z.infer<typeof AddNoteRequest>;
+
+/**
+ * How the local client relates to the session right now. The three states the
+ * UI must distinguish for a non-owner are `following`, `independent` and
+ * `lost-lease`; `owner` is the writer.
+ */
+export const ParticipantRole = z.enum(['owner', 'following', 'independent', 'lost-lease']);
+export type ParticipantRole = z.infer<typeof ParticipantRole>;
+
+/**
+ * Pushed over the existing /api/live socket whenever a session mutates (lease
+ * grant/takeover/release, cursor advance, note merge). Carries the full state
+ * so followers converge immediately; a reconnecting client also refetches via
+ * GET /api/sessions/:id, so the socket is an optimisation, not the source truth.
+ */
+export const SessionSignal = z.object({
+  type: z.literal('session'),
+  contractVersion: z.literal(CONTRACT_VERSION),
+  state: SessionState,
+});
+export type SessionSignal = z.infer<typeof SessionSignal>;
+
+/** Any frame the live socket may carry. */
+export const SocketMessage = z.discriminatedUnion('type', [LiveHello, LiveUpdate, SessionSignal]);
+export type SocketMessage = z.infer<typeof SocketMessage>;

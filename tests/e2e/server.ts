@@ -6,6 +6,21 @@ import { setTimeout as delay } from 'node:timers/promises';
 
 const ROOT = resolve(__dirname, '..', '..');
 
+/**
+ * Windows can briefly hold a lock on the SQLite file after the child server
+ * process exits; retry the cleanup so tests do not flake on EBUSY.
+ */
+export async function removeDirWithRetry(dir: string): Promise<void> {
+  for (let i = 0; i < 12; i++) {
+    try {
+      rmSync(dir, { recursive: true, force: true });
+      return;
+    } catch {
+      await delay(100);
+    }
+  }
+}
+
 export interface RunningServer {
   baseUrl: string;
   port: number;

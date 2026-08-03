@@ -1,32 +1,73 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import type { ProjectionView, ProjectedSpan, ReplayCursor } from '../shared/contract';
-import { fetchBounds, fetchView, openLive, type Bounds } from './api';
+import type {
+  ProjectionView,
+  ProjectedSpan,
+  ReplayCursor,
+  SessionState,
+  ParticipantRole,
+  IncidentSnapshot,
+} from '../shared/contract';
+import { effectiveCursor } from '../shared/collaboration';
+import { fetchBounds, fetchView, openLive, listSnapshots, type Bounds } from './api';
 import { TopologyScene } from './TopologyScene';
 import { SnapshotPanel } from './SnapshotPanel';
+import { CollaborationPanel } from './CollaborationPanel';
 
 type Mode = 'live' | 'paused';
+
+interface RoleInfo {
+  role: ParticipantRole;
+  followOwner: boolean;
+  holder: string;
+  sessionId: number | null;
+  fencingToken: number | null;
+}
 
 const EMPTY_BOUNDS: Bounds = { minEventTimeMs: 0, maxEventTimeMs: 0, maxIngestSequence: 0 };
 
 export function App(): JSX.Element {
   const [mode, setMode] = useState<Mode>('live');
   const [bounds, setBounds] = useState<Bounds>(EMPTY_BOUNDS);
-  const [cursor, setCursor] = useState<ReplayCursor>({ eventTimeMs: 0, ingestSequence: 0 });
+  // The client's own (independent) cursor, driven by the timeline scrub.
+  const [localCursor, setLocalCursor] = useState<ReplayCursor>({ eventTimeMs: 0, ingestSequence: 0 });
   const [view, setView] = useState<ProjectionView | null>(null);
   const [selectedSpanId, setSelectedSpanId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+
+  // Collaboration state (App owns it so it can drive the follow cursor).
+  const [session, setSession] = useState<SessionState | null>(null);
+  const [roleInfo, setRoleInfo] = useState<RoleInfo>({
+    role: 'independent',
+    followOwner: true,
+    holder: '',
+    sessionId: null,
+    fencingToken: null,
+  });
+  const [anchors, setAnchors] = useState<IncidentSnapshot[]>([]);
+
   const modeRef = useRef<Mode>('live');
   modeRef.current = mode;
+  const sessionRef = useRef<SessionState | null>(null);
+  sessionRef.current = session;
+  const refetchSessionRef = useRef<() => void>(() => {});
 
-  // Live head: while following, the cursor tracks the newest bounds.
+  // Live head: while following the live feed, the local cursor tracks bounds.
   const applyBounds = useCallback((b: Bounds) => {
     setBounds(b);
     if (modeRef.current === 'live') {
-      setCursor({ eventTimeMs: b.maxEventTimeMs, ingestSequence: b.maxIngestSequence });
+      setLocalCursor({ eventTimeMs: b.maxEventTimeMs, ingestSequence: b.maxIngestSequence });
     }
   }, []);
 
-  // Initial load + websocket follow.
+  const refreshAnchors = useCallback(() => {
+    listSnapshots()
+      .then(setAnchors)
+      .catch(() => {
+        /* anchors are optional; ignore */
+      });
+  }, []);
+
+  // Initial load + websocket follow (live records AND session signals).
   useEffect(() => {
     let cancelled = false;
     fetchBounds()
@@ -34,19 +75,49 @@ export function App(): JSX.Element {
         if (!cancelled) applyBounds(b);
       })
       .catch((e: unknown) => setError(String(e)));
-    const close = openLive((msg) => {
-      applyBounds(msg.bounds);
-    });
+    refreshAnchors();
+    const close = openLive(
+      (msg) => {
+        if (msg.type === 'session') {
+          // Only adopt signals for the session this client has joined.
+          if (sessionRef.current && msg.state.session.id === sessionRef.current.session.id) {
+            setSession(msg.state);
+          }
+        } else {
+          applyBounds(msg.bounds);
+          if (msg.type === 'live') refreshAnchors();
+        }
+      },
+      () => {
+        // On (re)connect, refetch authoritative state — socket is best-effort.
+        fetchBounds().then(applyBounds).catch(() => undefined);
+        refetchSessionRef.current();
+      },
+    );
     return () => {
       cancelled = true;
       close();
     };
-  }, [applyBounds]);
+  }, [applyBounds, refreshAnchors]);
 
-  // Whenever the cursor changes, fetch the reproducible view for it.
+  // The cursor actually displayed: a follower tracks the owner's shared cursor,
+  // everyone else uses their own local cursor.
+  const displayCursor: ReplayCursor = useMemo(() => {
+    if (session && roleInfo.role === 'following') {
+      return effectiveCursor({
+        role: 'following',
+        followOwner: true,
+        sharedCursor: session.sharedCursor,
+        localCursor,
+      });
+    }
+    return localCursor;
+  }, [session, roleInfo.role, localCursor]);
+
+  // Whenever the displayed cursor changes, fetch the reproducible view for it.
   useEffect(() => {
     let cancelled = false;
-    fetchView(cursor)
+    fetchView(displayCursor)
       .then((v) => {
         if (!cancelled) {
           setView(v);
@@ -57,13 +128,13 @@ export function App(): JSX.Element {
     return () => {
       cancelled = true;
     };
-  }, [cursor.eventTimeMs, cursor.ingestSequence]);
+  }, [displayCursor.eventTimeMs, displayCursor.ingestSequence]);
 
   const toggleMode = useCallback(() => {
     setMode((m) => {
       const next = m === 'live' ? 'paused' : 'live';
       if (next === 'live') {
-        setCursor({ eventTimeMs: bounds.maxEventTimeMs, ingestSequence: bounds.maxIngestSequence });
+        setLocalCursor({ eventTimeMs: bounds.maxEventTimeMs, ingestSequence: bounds.maxIngestSequence });
       }
       return next;
     });
@@ -71,11 +142,11 @@ export function App(): JSX.Element {
 
   const onScrubTime = useCallback((value: number) => {
     setMode('paused');
-    setCursor((c) => ({ ...c, eventTimeMs: value }));
+    setLocalCursor((c) => ({ ...c, eventTimeMs: value }));
   }, []);
   const onScrubIngest = useCallback((value: number) => {
     setMode('paused');
-    setCursor((c) => ({ ...c, ingestSequence: value }));
+    setLocalCursor((c) => ({ ...c, ingestSequence: value }));
   }, []);
 
   const selectedSpan = useMemo<ProjectedSpan | null>(() => {
@@ -84,6 +155,21 @@ export function App(): JSX.Element {
   }, [view, selectedSpanId]);
 
   const errorCount = view ? view.spans.filter((s) => s.status === 'error').length : 0;
+
+  // Following clients cannot scrub the shared cursor themselves.
+  const scrubDisabled = session !== null && roleInfo.role === 'following';
+  // Writer credential passed to the snapshot sealer when owning the lease.
+  const writerCred =
+    session !== null && roleInfo.role === 'owner' && roleInfo.fencingToken !== null
+      ? { sessionId: session.session.id, holder: roleInfo.holder, fencingToken: roleInfo.fencingToken }
+      : null;
+  // A seal is blocked when in a session but not the owner (would be fenced out).
+  const sealBlockedReason =
+    session !== null && roleInfo.role !== 'owner'
+      ? roleInfo.role === 'lost-lease'
+        ? '你已失去租约，需重新接管后才能封存'
+        : '仅负责人可封存；请先接管租约'
+      : null;
 
   return (
     <div className="layout">
@@ -114,11 +200,12 @@ export function App(): JSX.Element {
               type="range"
               min={bounds.minEventTimeMs}
               max={Math.max(bounds.maxEventTimeMs, bounds.minEventTimeMs)}
-              value={cursor.eventTimeMs}
+              value={displayCursor.eventTimeMs}
+              disabled={scrubDisabled}
               onChange={(e) => onScrubTime(Number(e.target.value))}
               data-testid="scrub-time"
             />
-            <output>{formatTime(cursor.eventTimeMs, bounds.minEventTimeMs)}</output>
+            <output>{formatTime(displayCursor.eventTimeMs, bounds.minEventTimeMs)}</output>
           </label>
           <label>
             采集进度 (ingestSequence — 已到达的知识)
@@ -126,15 +213,21 @@ export function App(): JSX.Element {
               type="range"
               min={0}
               max={Math.max(bounds.maxIngestSequence, 0)}
-              value={cursor.ingestSequence}
+              value={displayCursor.ingestSequence}
+              disabled={scrubDisabled}
               onChange={(e) => onScrubIngest(Number(e.target.value))}
               data-testid="scrub-ingest"
             />
             <output data-testid="ingest-value">
-              #{cursor.ingestSequence} / {bounds.maxIngestSequence}
+              #{displayCursor.ingestSequence} / {bounds.maxIngestSequence}
             </output>
           </label>
         </div>
+        {scrubDisabled && (
+          <div className="follow-note" data-testid="follow-note">
+            正在跟随负责人的共同游标（时间线只读）；切换为“独立查看”后可自行拖动。
+          </div>
+        )}
         <div className="summary" data-testid="view-summary">
           {view ? (
             <>
@@ -199,7 +292,24 @@ export function App(): JSX.Element {
             )}
           </div>
 
-          <SnapshotPanel cursor={cursor} baseEventTimeMs={bounds.minEventTimeMs} />
+          <SnapshotPanel
+            cursor={displayCursor}
+            baseEventTimeMs={bounds.minEventTimeMs}
+            writer={writerCred}
+            sealBlockedReason={sealBlockedReason}
+            onSealed={refreshAnchors}
+          />
+
+          <CollaborationPanel
+            localCursor={displayCursor}
+            session={session}
+            setSession={setSession}
+            onRoleChange={setRoleInfo}
+            anchors={anchors.map((a) => ({ id: a.id, label: a.label, digest: a.provenance.digest }))}
+            registerRefetch={(fn) => {
+              refetchSessionRef.current = fn;
+            }}
+          />
         </aside>
       </main>
     </div>

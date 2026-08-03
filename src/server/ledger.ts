@@ -93,6 +93,42 @@ export class Ledger {
         sealedAtMs     INTEGER NOT NULL
       );
       CREATE INDEX IF NOT EXISTS idx_snapshots_seq ON snapshots (id);
+
+      -- Cross-shift collaboration session, anchored to a sealed snapshot.
+      -- The lease + fencing token + shared cursor are columns on this single
+      -- row per session, so lease/ownership survives restart and reconnect.
+      CREATE TABLE IF NOT EXISTS sessions (
+        id               INTEGER PRIMARY KEY AUTOINCREMENT,
+        contractVersion  INTEGER NOT NULL,
+        label            TEXT    NOT NULL,
+        anchorSnapshotId INTEGER NOT NULL,
+        anchorDigest     TEXT    NOT NULL,
+        createdAtMs      INTEGER NOT NULL,
+        -- Lease (nullable holder means nobody holds it right now).
+        leaseHolder      TEXT,
+        leaseExpiresAtMs INTEGER,
+        leaseToken       INTEGER,
+        -- Monotonic highest fencing token ever minted for this session.
+        highestFencingToken INTEGER NOT NULL DEFAULT 0,
+        -- Shared cursor the owner drives; followers track it.
+        sharedEventTimeMs   INTEGER NOT NULL,
+        sharedIngestSequence INTEGER NOT NULL,
+        sharedCursorToken    INTEGER NOT NULL DEFAULT 0,
+        FOREIGN KEY (anchorSnapshotId) REFERENCES snapshots (id)
+      );
+
+      -- Investigation notes. Idempotent by (sessionId, noteId); merge order is
+      -- computed deterministically from (lamport, author, id) on read.
+      CREATE TABLE IF NOT EXISTS session_notes (
+        sessionId   INTEGER NOT NULL,
+        noteId      TEXT    NOT NULL,
+        author      TEXT    NOT NULL,
+        lamport     INTEGER NOT NULL,
+        body        TEXT    NOT NULL,
+        createdAtMs INTEGER NOT NULL,
+        PRIMARY KEY (sessionId, noteId),
+        FOREIGN KEY (sessionId) REFERENCES sessions (id)
+      );
     `);
 
     const existing = this.db
@@ -227,9 +263,122 @@ export class Ledger {
     return this.db.prepare('SELECT * FROM snapshots ORDER BY id ASC').all() as SnapshotRow[];
   }
 
+  // --- Collaboration sessions (same store; lease/fencing/notes persisted) ---
+
+  insertSession(row: SessionInsert): number {
+    const info = this.db
+      .prepare(
+        `INSERT INTO sessions (
+           contractVersion, label, anchorSnapshotId, anchorDigest, createdAtMs,
+           leaseHolder, leaseExpiresAtMs, leaseToken, highestFencingToken,
+           sharedEventTimeMs, sharedIngestSequence, sharedCursorToken
+         ) VALUES (
+           @contractVersion, @label, @anchorSnapshotId, @anchorDigest, @createdAtMs,
+           NULL, NULL, NULL, 0,
+           @sharedEventTimeMs, @sharedIngestSequence, 0
+         )`,
+      )
+      .run(row);
+    return Number(info.lastInsertRowid);
+  }
+
+  getSession(id: number): SessionRow | null {
+    const row = this.db.prepare('SELECT * FROM sessions WHERE id = ?').get(id) as
+      | SessionRow
+      | undefined;
+    return row ?? null;
+  }
+
+  /**
+   * Persist lease + shared-cursor state for a session. Called inside a
+   * transaction by the collaboration service so a grant and its fencing-token
+   * bump land atomically.
+   */
+  updateSessionState(row: {
+    id: number;
+    leaseHolder: string | null;
+    leaseExpiresAtMs: number | null;
+    leaseToken: number | null;
+    highestFencingToken: number;
+    sharedEventTimeMs: number;
+    sharedIngestSequence: number;
+    sharedCursorToken: number;
+  }): void {
+    this.db
+      .prepare(
+        `UPDATE sessions SET
+           leaseHolder = @leaseHolder,
+           leaseExpiresAtMs = @leaseExpiresAtMs,
+           leaseToken = @leaseToken,
+           highestFencingToken = @highestFencingToken,
+           sharedEventTimeMs = @sharedEventTimeMs,
+           sharedIngestSequence = @sharedIngestSequence,
+           sharedCursorToken = @sharedCursorToken
+         WHERE id = @id`,
+      )
+      .run(row);
+  }
+
+  /** Idempotent note insert: same (sessionId, noteId) is ignored on re-send. */
+  insertNote(row: NoteRow): void {
+    this.db
+      .prepare(
+        `INSERT OR IGNORE INTO session_notes (
+           sessionId, noteId, author, lamport, body, createdAtMs
+         ) VALUES (@sessionId, @noteId, @author, @lamport, @body, @createdAtMs)`,
+      )
+      .run(row);
+  }
+
+  listNotes(sessionId: number): NoteRow[] {
+    return this.db
+      .prepare('SELECT * FROM session_notes WHERE sessionId = ?')
+      .all(sessionId) as NoteRow[];
+  }
+
+  /** Run a function inside a single write transaction (for atomic lease ops). */
+  transaction<T>(fn: () => T): T {
+    return this.db.transaction(fn)();
+  }
+
   close(): void {
     this.db.close();
   }
+}
+
+export interface SessionInsert {
+  contractVersion: number;
+  label: string;
+  anchorSnapshotId: number;
+  anchorDigest: string;
+  createdAtMs: number;
+  sharedEventTimeMs: number;
+  sharedIngestSequence: number;
+}
+
+export interface SessionRow {
+  id: number;
+  contractVersion: number;
+  label: string;
+  anchorSnapshotId: number;
+  anchorDigest: string;
+  createdAtMs: number;
+  leaseHolder: string | null;
+  leaseExpiresAtMs: number | null;
+  leaseToken: number | null;
+  highestFencingToken: number;
+  sharedEventTimeMs: number;
+  sharedIngestSequence: number;
+  sharedCursorToken: number;
+}
+
+export interface NoteRow {
+  sessionId: number;
+  noteId: string;
+  author: string;
+  lamport: number;
+  body: string;
+  createdAtMs: number;
 }
 
 export interface SnapshotInsert {

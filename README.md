@@ -42,27 +42,54 @@
 界面右侧"事故快照对比"面板：拖动时间线到关键时刻 → 填备注 → 封存（自动标 A/B/C…）→
 选定 A、B → 比较，即得带 provenance 与摘要指纹的差异列表。
 
+## 跨班协作：共享会话 + 租约/fencing + 备注归并
+
+两个值班小组交接时，以**已封存快照的 id + 摘要**作为交接锚点，围绕它开一个共享
+调查会话。这是**协作层，不是通用账号/权限后台**：
+
+| 需求 | 实现 |
+| --- | --- |
+| 以快照 id + 摘要为交接锚点 | 建会话时校验 `anchorDigest` 必须等于该封存快照的 digest（`createSession`） |
+| 只有持租约方能封存/推进共同游标 | 写路径（`POST /api/snapshots` 带 writer、`/cursor`）经 `checkWriter` 租约+token 校验 |
+| 租约过期后旧客户端不能覆盖新负责人 | **fencing token**：每次授予/接管单调 +1；写请求 token 必须 == 当前租约 token，过期或被超越一律拒绝（即使请求晚到） |
+| 普通备注确定性归并（非 LWW） | `mergeNotes()` 按 id 取并集，按 `(lamport, author, id)` 全序排序；并发备注都保留且各端收敛一致 |
+| 租约/token/归并结果持久化 | `sessions`（单行含租约、`highestFencingToken`、共同游标）+ `session_notes`（`(sessionId,noteId)` 幂等）与账本同库 |
+| 重启/重连后仍成立 | 全部落 SQLite；重连时前端 `onReconnect` 重新 `GET /api/sessions/:id`（socket 只是加速，REST 才是权威） |
+
+三种参与状态（`classifyRole` 纯函数，界面明确区分）：
+- **负责人 (owner)**：持有效租约且 token 为当前值，可封存 / 推进共同游标。
+- **跟随负责人 (following)**：非负责人且选择跟随，时间线只读、跟随共同游标。
+- **独立查看 (independent)**：非负责人且自行拖动本地游标，不影响共同游标。
+- **已失去租约 (lost-lease)**：曾持租约但已过期或被更高 token 接管；写操作会被 fencing 拒绝，需重新接管。
+
+`fencingToken` 单调且**跨重启不回退**（存于 `sessions.highestFencingToken`）。旧负责人
+即便断线后携旧 token 晚到，`checkWriter` 也会因 `token !== 当前租约 token` 拒绝，
+从而无法覆盖新负责人。
+
 ## 目录结构
 
 ```
 src/
-  shared/        # 前后端共享的版本化契约 (zod) + 纯投影/快照函数
+  shared/        # 前后端共享的版本化契约 (zod) + 纯投影/快照/协作函数
     contract.ts    # SpanEventInput / LedgerRecord / ReplayCursor / ProjectionView
-                   #   + IncidentSnapshot / SnapshotComparison / SpanDelta ...
+                   #   + IncidentSnapshot / SnapshotComparison
+                   #   + CollaborationLease / SessionState / InvestigationNote ...
     projection.ts  # projectView(): 唯一的、纯粹的、可复现的视图生成逻辑
     snapshot.ts    # canonicalSnapshotContent() 摘要内容 + diffSnapshotViews() 对比
+    collaboration.ts # mergeNotes() 确定性归并 + classifyRole() 三态判定（纯函数）
     ndjson.ts      # NDJSON 解析/序列化
-  server/        # Fastify：NDJSON 接入 + WS 实时跟随 + 视图查询 + 快照/对比 + 静态托管
-    ledger.ts      # 只追加的 SQLite 账本（含只插入的 snapshots 表）
+  server/        # Fastify：接入 + WS + 视图 + 快照/对比 + 会话/租约/备注 + 静态托管
+    ledger.ts      # 只追加账本（含只插入 snapshots、sessions、session_notes 表）
     snapshots.ts   # 封存/复现/对比/校验 + sha256 摘要 (node:crypto)
+    collaboration.ts # 会话/租约/fencing/共同游标/备注服务（时钟注入，便于确定性测试）
     app.ts         # 路由与投影装配（可被测试单独引导）
     main.ts        # npm start 入口
   sample/        # 确定性样例流：制造乱序/重复/修订/重连
-  web/           # React + Three.js 主界面 + SnapshotPanel 快照对比面板
+  web/           # React + Three.js 主界面 + SnapshotPanel + CollaborationPanel
 tests/
-  unit/          # 投影语义、样例确定性、契约校验、摘要确定性 + diff 分类
-  integration/   # 账本 + HTTP 应用 + 重启恢复 + 快照封存/不可变/重启稳定/对比
-  e2e/           # Playwright：启动 dist 真实服务，真网络接入 + 浏览器交互 + 快照封存/迟到/重启
+  unit/          # 投影/样例/契约/摘要/diff + 协作归并与三态判定
+  integration/   # 账本 + HTTP + 重启恢复 + 快照不可变 + 会话租约/fencing/备注/重启
+  e2e/           # Playwright：真实服务 + 浏览器；快照封存/迟到/重启 + 双浏览器协作交接
 ```
 
 ## 命令入口

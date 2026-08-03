@@ -286,3 +286,46 @@ body {
 .tag.status { color: var(--err); border-color: var(--err); }
 .tag.rev { color: var(--errpath); border-color: var(--errpath); }
 .tag.path { color: var(--accent); border-color: var(--accent); }
+
+/* --- Collaboration panel --- */
+.collab-panel { padding: 12px 14px; border-top: 1px solid var(--line); overflow: auto; }
+.collab-header { display: flex; align-items: center; justify-content: space-between; }
+.collab-panel h3 { margin: 0 0 8px; font-size: 13px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.6px; }
+.collab-header .me { font-size: 12px; color: var(--accent); font-family: ui-monospace, Consolas, monospace; }
+
+.role { padding: 8px 10px; border-radius: 8px; font-size: 13px; margin-bottom: 10px; border: 1px solid var(--line); }
+.role.owner { color: #04201f; background: var(--accent); font-weight: 600; }
+.role.following { color: var(--text); background: #14263a; border-color: var(--accent); }
+.role.independent { color: var(--muted); background: #16223a; }
+.role.lost { color: #fff; background: #3a1216; border-color: var(--err); font-weight: 600; }
+.role .owner-name { opacity: 0.85; }
+
+.collab-join .hint, .collab-controls + .collab-shared { font-size: 12px; color: var(--muted); }
+.anchor-list { display: flex; flex-direction: column; gap: 6px; margin: 8px 0; }
+.join-by-id, .note-input { display: flex; gap: 6px; margin-top: 6px; }
+.join-by-id input, .note-input input {
+  flex: 1; background: #0e1523; color: var(--text);
+  border: 1px solid var(--line); border-radius: 8px; padding: 6px 8px; font-size: 13px;
+}
+
+.collab-anchor { font-size: 12px; color: var(--muted); margin-bottom: 8px; }
+.collab-anchor .mono { font-family: ui-monospace, Consolas, monospace; color: var(--errpath); }
+.collab-controls { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 8px; }
+.collab-shared {
+  font-size: 11px; color: var(--muted);
+  font-family: ui-monospace, Consolas, monospace;
+  padding: 6px 8px; background: #131d30; border-radius: 8px; margin-bottom: 10px;
+}
+
+.collab-notes h4 { margin: 6px 0; font-size: 12px; }
+.collab-notes ul { list-style: none; margin: 8px 0 0; padding: 0; display: flex; flex-direction: column; gap: 4px; }
+.collab-notes li {
+  display: grid; grid-template-columns: auto auto 1fr; gap: 8px; align-items: baseline;
+  font-size: 12px; padding: 4px 6px; border-radius: 6px; background: #131d30;
+}
+.note-order { color: var(--errpath); font-family: ui-monospace, Consolas, monospace; }
+.note-author { color: var(--accent); }
+.note-body { color: var(--text); word-break: break-word; }
+
+.follow-note { font-size: 12px; color: var(--errpath); padding: 4px 0; }
+.snap-blocked { font-size: 12px; color: var(--errpath); margin: 4px 0 0; }

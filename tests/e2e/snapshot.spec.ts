@@ -1,8 +1,8 @@
 import { test, expect } from '@playwright/test';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { startServer, type RunningServer } from './server';
+import { startServer, removeDirWithRetry, type RunningServer } from './server';
 import { seedIncident, ingest } from './seed';
 import { buildScript } from '../../src/sample/script';
 
@@ -117,7 +117,7 @@ test.describe('incident snapshots & comparison (real server + browser)', () => {
       await expect(page.getByTestId('snapshot-1')).toBeVisible();
     } finally {
       if (server) await server.stop();
-      rmSync(dir, { recursive: true, force: true });
+      await removeDirWithRetry(dir);
     }
   });
 });

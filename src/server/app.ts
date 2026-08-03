@@ -15,13 +15,32 @@ import {
   verifySnapshotDigest,
 } from './snapshots';
 import {
+  SessionError,
+  acquireLease,
+  addNote,
+  advanceSharedCursor,
+  checkWriter,
+  createSession,
+  getSessionState,
+  releaseLease,
+  renewLease,
+} from './collaboration';
+import {
   CONTRACT_VERSION,
   ReplayCursor,
   SealSnapshotRequest,
+  CreateSessionRequest,
+  AcquireLeaseRequest,
+  RenewLeaseRequest,
+  ReleaseLeaseRequest,
+  AdvanceCursorRequest,
+  AddNoteRequest,
   type IngestResult,
   type LiveHello,
   type LiveUpdate,
   type ProjectionView,
+  type SessionSignal,
+  type SessionState,
 } from '../shared/contract';
 
 export interface BuildAppOptions {
@@ -106,6 +125,20 @@ export function buildApp(options: BuildAppOptions): AppBundle {
     if (!parsed.success) {
       return reply.status(400).send({ error: 'invalid snapshot request', issues: parsed.error.issues });
     }
+    // When sealing under a shared session, the lease + fencing token gates it:
+    // only the current valid holder may seal. A stale/expired writer is fenced
+    // out even if the request arrives late.
+    const writer = parsed.data.writer;
+    if (writer !== undefined) {
+      const guard = checkWriter(ledger, writer.sessionId, writer.holder, writer.fencingToken, Date.now());
+      if (!guard.ok) {
+        return reply.status(409).send({
+          error: 'not the current lease holder',
+          reason: guard.reason,
+          state: guard.state,
+        });
+      }
+    }
     const sealed = sealSnapshot(ledger, parsed.data, Date.now());
     return reply.status(201).send(sealed);
   });
@@ -156,6 +189,134 @@ export function buildApp(options: BuildAppOptions): AppBundle {
     return reply.send(comparison);
   });
 
+  // --- Collaboration sessions: lease + fencing + deterministic notes. ---
+  function sessionErrorStatus(code: SessionError['code']): number {
+    switch (code) {
+      case 'not-found':
+        return 404;
+      case 'anchor-mismatch':
+        return 409;
+      case 'conflict':
+        return 409;
+      case 'invalid':
+        return 400;
+      default:
+        return 400;
+    }
+  }
+
+  // Create a shared session anchored to a sealed snapshot (the handoff anchor).
+  app.post('/api/sessions', async (req, reply) => {
+    const parsed = CreateSessionRequest.safeParse(req.body);
+    if (!parsed.success) {
+      return reply.status(400).send({ error: 'invalid session request', issues: parsed.error.issues });
+    }
+    try {
+      const state = createSession(ledger, parsed.data, Date.now());
+      broadcastSession(state);
+      return reply.status(201).send(state);
+    } catch (e) {
+      if (e instanceof SessionError) return reply.status(sessionErrorStatus(e.code)).send({ error: e.message, code: e.code });
+      throw e;
+    }
+  });
+
+  // Read the full, reconnect-safe session state (source of truth on reconnect).
+  app.get('/api/sessions/:id', async (req, reply) => {
+    const id = Number((req.params as { id: string }).id);
+    if (!Number.isInteger(id) || id <= 0) return reply.status(400).send({ error: 'invalid session id' });
+    const state = getSessionState(ledger, id, Date.now());
+    if (state === null) return reply.status(404).send({ error: 'session not found' });
+    return reply.send(state);
+  });
+
+  app.post('/api/sessions/:id/lease', async (req, reply) => {
+    const id = Number((req.params as { id: string }).id);
+    const parsed = AcquireLeaseRequest.safeParse(req.body);
+    if (!Number.isInteger(id) || id <= 0 || !parsed.success) {
+      return reply.status(400).send({ error: 'invalid lease request' });
+    }
+    try {
+      const state = acquireLease(ledger, id, parsed.data.holder, parsed.data.ttlMs, Date.now());
+      broadcastSession(state);
+      return reply.status(201).send(state);
+    } catch (e) {
+      if (e instanceof SessionError) return reply.status(sessionErrorStatus(e.code)).send({ error: e.message, code: e.code });
+      throw e;
+    }
+  });
+
+  app.put('/api/sessions/:id/lease', async (req, reply) => {
+    const id = Number((req.params as { id: string }).id);
+    const parsed = RenewLeaseRequest.safeParse(req.body);
+    if (!Number.isInteger(id) || id <= 0 || !parsed.success) {
+      return reply.status(400).send({ error: 'invalid renew request' });
+    }
+    try {
+      const state = renewLease(ledger, id, parsed.data.holder, parsed.data.fencingToken, parsed.data.ttlMs, Date.now());
+      broadcastSession(state);
+      return reply.send(state);
+    } catch (e) {
+      if (e instanceof SessionError) return reply.status(sessionErrorStatus(e.code)).send({ error: e.message, code: e.code });
+      throw e;
+    }
+  });
+
+  app.delete('/api/sessions/:id/lease', async (req, reply) => {
+    const id = Number((req.params as { id: string }).id);
+    const parsed = ReleaseLeaseRequest.safeParse(req.body);
+    if (!Number.isInteger(id) || id <= 0 || !parsed.success) {
+      return reply.status(400).send({ error: 'invalid release request' });
+    }
+    try {
+      const state = releaseLease(ledger, id, parsed.data.holder, parsed.data.fencingToken, Date.now());
+      broadcastSession(state);
+      return reply.send(state);
+    } catch (e) {
+      if (e instanceof SessionError) return reply.status(sessionErrorStatus(e.code)).send({ error: e.message, code: e.code });
+      throw e;
+    }
+  });
+
+  // Advance the shared cursor (owner-only, gated by fencing token).
+  app.post('/api/sessions/:id/cursor', async (req, reply) => {
+    const id = Number((req.params as { id: string }).id);
+    const parsed = AdvanceCursorRequest.safeParse(req.body);
+    if (!Number.isInteger(id) || id <= 0 || !parsed.success) {
+      return reply.status(400).send({ error: 'invalid cursor request' });
+    }
+    const { guard, state } = advanceSharedCursor(
+      ledger,
+      id,
+      parsed.data.holder,
+      parsed.data.fencingToken,
+      parsed.data.cursor,
+      Date.now(),
+    );
+    if (!guard.ok) {
+      return reply.status(409).send({ error: 'cursor advance rejected', reason: guard.reason, state: guard.state });
+    }
+    if (state !== null) broadcastSession(state);
+    return reply.send(state);
+  });
+
+  // Add an investigation note (NOT lease-gated; deterministically merged).
+  app.post('/api/sessions/:id/notes', async (req, reply) => {
+    const id = Number((req.params as { id: string }).id);
+    const parsed = AddNoteRequest.safeParse(req.body);
+    if (!Number.isInteger(id) || id <= 0 || !parsed.success) {
+      return reply.status(400).send({ error: 'invalid note request' });
+    }
+    try {
+      const state = addNote(ledger, id, parsed.data.note, Date.now());
+      broadcastSession(state);
+      return reply.status(201).send(state);
+    } catch (e) {
+      if (e instanceof SessionError) return reply.status(sessionErrorStatus(e.code)).send({ error: e.message, code: e.code });
+      throw e;
+    }
+  });
+
   // --- Live follow: push the ledger head as new records arrive. ---
   app.get('/api/live', { websocket: true }, (socket) => {
     sockets.add(socket);
@@ -187,6 +348,19 @@ export function buildApp(options: BuildAppOptions): AppBundle {
       bounds: ledger.bounds(),
       latest,
     };
+    const payload = JSON.stringify(msg);
+    for (const s of sockets) {
+      try {
+        s.send(payload);
+      } catch {
+        sockets.delete(s);
+      }
+    }
+  }
+
+  // Push a full session state to every follower so they converge immediately.
+  function broadcastSession(state: SessionState): void {
+    const msg: SessionSignal = { type: 'session', contractVersion: CONTRACT_VERSION, state };
     const payload = JSON.stringify(msg);
     for (const s of sockets) {
       try {

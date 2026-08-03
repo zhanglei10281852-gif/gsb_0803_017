@@ -11,6 +11,12 @@ interface Props {
   /** The cursor currently shown in the main replay view. */
   cursor: ReplayCursor;
   baseEventTimeMs: number;
+  /** When set, seals are gated by the session lease + fencing token. */
+  writer?: { sessionId: number; holder: string; fencingToken: number } | null;
+  /** Non-null when sealing is blocked (in a session but not the owner). */
+  sealBlockedReason?: string | null;
+  /** Notify the parent when a new snapshot is sealed (to refresh anchors). */
+  onSealed?: () => void;
 }
 
 /**
@@ -18,8 +24,11 @@ interface Props {
  * ReplayCursor the 3D view uses) into an immutable IncidentSnapshot, then diffs
  * two sealed snapshots A -> B. No bypass model: everything is derived from the
  * shared ledger + projection via the server API.
+ *
+ * Under a shared session, sealing carries the writer credential so the server
+ * fences out anyone who is not the current lease holder.
  */
-export function SnapshotPanel({ cursor, baseEventTimeMs }: Props): JSX.Element {
+export function SnapshotPanel({ cursor, baseEventTimeMs, writer, sealBlockedReason, onSealed }: Props): JSX.Element {
   const [snapshots, setSnapshots] = useState<IncidentSnapshot[]>([]);
   const [note, setNote] = useState('');
   const [fromId, setFromId] = useState<number | null>(null);
@@ -52,10 +61,12 @@ export function SnapshotPanel({ cursor, baseEventTimeMs }: Props): JSX.Element {
         label: nextLabel,
         note: note.trim() === '' ? null : note.trim(),
         cursor,
+        ...(writer ? { writer } : {}),
       });
       setNote('');
       const list = await listSnapshots();
       setSnapshots(list);
+      onSealed?.();
       // Auto-select the two most recent snapshots as A/B for convenience.
       if (fromId === null) setFromId(sealed.snapshot.id);
       else setToId(sealed.snapshot.id);
@@ -64,7 +75,7 @@ export function SnapshotPanel({ cursor, baseEventTimeMs }: Props): JSX.Element {
     } finally {
       setBusy(false);
     }
-  }, [cursor, note, snapshots.length, fromId]);
+  }, [cursor, note, snapshots.length, fromId, writer, onSealed]);
 
   const onCompare = useCallback(async () => {
     if (fromId === null || toId === null) return;
@@ -102,11 +113,14 @@ export function SnapshotPanel({ cursor, baseEventTimeMs }: Props): JSX.Element {
           type="button"
           className="btn live"
           onClick={() => void onSeal()}
-          disabled={busy}
+          disabled={busy || sealBlockedReason != null}
           data-testid="seal-snapshot"
         >
           封存当前游标为快照
         </button>
+        {sealBlockedReason != null && (
+          <p className="snap-blocked" data-testid="seal-blocked">🔒 {sealBlockedReason}</p>
+        )}
         <p className="snap-hint">
           将封存 事件时间 +{Math.max(0, cursor.eventTimeMs - baseEventTimeMs)}ms · 采集 #
           {cursor.ingestSequence}

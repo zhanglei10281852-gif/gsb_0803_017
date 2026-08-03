@@ -175,7 +175,64 @@ export type IngestResult =
 export type WsServerMessage =
   | { type: 'record'; record: LedgerRecord; head: ReplayCursor }
   | { type: 'snapshot'; head: ReplayCursor; totalLedgerRecords: number }
-  | { type: 'sample'; running: boolean };
+  | { type: 'sample'; running: boolean }
+  | { type: 'session-state'; lease: LeaseState | null; notes: SessionNote[]; now: number; selfClientId: string | null }
+  | { type: 'lease-acquired'; lease: LeaseState }
+  | { type: 'lease-changed'; lease: LeaseState | null; reason: string }
+  | { type: 'cursor-broadcast'; cursor: ReplayCursor; fencingToken: number; byClientId: string }
+  | { type: 'notes-appended'; notes: SessionNote[] }
+  | { type: 'lease-error'; error: LeaseError };
+
+export type WsClientMessage =
+  | { type: 'hello'; clientId: string; clientName: string }
+  | { type: 'acquire-lease'; clientId: string; ttlMs: number; clientName: string }
+  | { type: 'renew-lease'; clientId: string; fencingToken: number }
+  | { type: 'release-lease'; clientId: string; fencingToken: number }
+  | { type: 'advance-cursor'; clientId: string; fencingToken: number; cursor: ReplayCursor }
+  | { type: 'add-note'; note: { clientId: string; clientSeq: number; authorName: string; text: string; snapshotId: string | null; createdAt?: number } };
+
+export interface LeaseState {
+  fencingToken: number;
+  holderClientId: string;
+  holderName: string;
+  acquiredAt: number;
+  expiresAt: number;
+  sharedCursor: ReplayCursor;
+}
+
+export interface SessionNote {
+  clientId: string;
+  clientSeq: number;
+  authorName: string;
+  text: string;
+  snapshotId: string | null;
+  createdAt: number;
+}
+
+export type LeaseErrorCode = 'LEASE_HELD' | 'STALE_FENCING' | 'LEASE_EXPIRED' | 'NOT_LEADER' | 'BAD_REQUEST';
+
+export interface LeaseError {
+  code: LeaseErrorCode;
+  message: string;
+  currentFencingToken: number;
+  currentHolder: string | null;
+  expiresAt: number | null;
+}
+
+export interface AcquireLeaseResponse {
+  ok: boolean;
+  lease: LeaseState | null;
+  error: LeaseError | null;
+}
+
+export interface SealRequest {
+  slot: SnapshotSlot;
+  label?: string;
+  cursor: ReplayCursor;
+  notes?: string;
+  fencingToken?: number | null;
+  clientId?: string | null;
+}
 
 export function makeRawSpanEvent(
   init: Omit<RawSpanEvent, 'contractVersion'>,

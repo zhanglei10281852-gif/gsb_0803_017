@@ -15,6 +15,10 @@ import {
 interface SnapshotPanelProps {
   cursor: ReplayCursor;
   onJumpTo: (cursor: ReplayCursor) => void;
+  fencing: { clientId: string; token: number } | null;
+  leaderName: string;
+  isLeader: boolean;
+  leaseActive: boolean;
 }
 
 function formatTime(ms: number): string {
@@ -43,7 +47,7 @@ function SpanRef({ span, kind }: { span: SpanView; kind: 'add' | 'remove' | 'cha
   );
 }
 
-export function SnapshotPanel({ cursor, onJumpTo }: SnapshotPanelProps): JSX.Element {
+export function SnapshotPanel({ cursor, onJumpTo, fencing, leaderName, isLeader, leaseActive }: SnapshotPanelProps): JSX.Element {
   const [snapA, setSnapA] = useState<IncidentSnapshot | null>(null);
   const [snapB, setSnapB] = useState<IncidentSnapshot | null>(null);
   const [diff, setDiff] = useState<SnapshotDiff | null>(null);
@@ -81,14 +85,19 @@ export function SnapshotPanel({ cursor, onJumpTo }: SnapshotPanelProps): JSX.Ele
     setBusy(true);
     try {
       const label = slot === 'A' ? `Moment A @ seq ${cursor.ingestSequence}` : `Moment B @ seq ${cursor.ingestSequence}`;
-      await createSnapshot(slot, cursor, label, '');
+      await createSnapshot(slot, cursor, label, '', fencing);
       await refreshAll();
     } catch (e) {
       setError((e as Error).message);
     } finally {
       setBusy(false);
     }
-  }, [cursor, refreshAll]);
+  }, [cursor, refreshAll, fencing]);
+
+  const canSeal = !leaseActive || isLeader;
+  const sealHint = leaseActive && !isLeader
+    ? `Only ${leaderName} (lease holder) can seal snapshots. Take over the lease to seal.`
+    : null;
 
   const handleSaveNotes = useCallback(async (slot: 'A' | 'B') => {
     const snap = slot === 'A' ? snapA : snapB;
@@ -116,16 +125,17 @@ export function SnapshotPanel({ cursor, onJumpTo }: SnapshotPanelProps): JSX.Ele
       <div className="snapshot-header">
         <span className="snapshot-title">📸 Incident comparison — seal two replay cursors</span>
         <div className="snapshot-actions">
-          <button onClick={() => void handleCapture('A')} disabled={busy} className="snap-a">
+          <button onClick={() => void handleCapture('A')} disabled={busy || !canSeal} className="snap-a">
             Seal A here
           </button>
-          <button onClick={() => void handleCapture('B')} disabled={busy} className="snap-b">
+          <button onClick={() => void handleCapture('B')} disabled={busy || !canSeal} className="snap-b">
             Seal B here
           </button>
           <button onClick={() => void refreshAll()} disabled={busy}>↻ Refresh</button>
         </div>
       </div>
 
+      {sealHint && <div className="snapshot-hint" style={{ borderColor: 'var(--warn)', color: 'var(--warn)' }}>{sealHint}</div>}
       {error && <div className="snapshot-error">{error}</div>}
 
       <div className="snapshot-cards">

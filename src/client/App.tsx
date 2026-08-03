@@ -13,12 +13,15 @@ import {
   fetchSpanVersions,
   startSample,
   stopSample,
+  sendWs,
 } from './api.js';
 import { Topology3D, type Selection } from './components/Topology3D.js';
 import { SpanList } from './components/SpanList.js';
 import { SpanDetail } from './components/SpanDetail.js';
 import { Timeline } from './components/Timeline.js';
 import { SnapshotPanel } from './components/SnapshotPanel.js';
+import { SessionBar } from './components/SessionBar.js';
+import { useSession } from './hooks/useSession.js';
 
 const EMPTY_VIEW: ReplayView = {
   cursor: emptyHead(),
@@ -41,6 +44,9 @@ export function App() {
   const [wsConnected, setWsConnected] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [showSnapshots, setShowSnapshots] = useState(false);
+  const [wsInstance, setWsInstance] = useState<WebSocket | null>(null);
+
+  const wsRef = useRef<WebSocket | null>(null);
 
   const cursorRef = useRef(cursor);
   const isLiveRef = useRef(isLive);
@@ -48,6 +54,14 @@ export function App() {
   const abortRef = useRef<AbortController | null>(null);
   const versionsAbortRef = useRef<AbortController | null>(null);
   const fetchTimerRef = useRef<number | null>(null);
+  const broadcastTimerRef = useRef<number | null>(null);
+
+  const onSharedCursor = useCallback((c: ReplayCursor) => {
+    setIsLive(false);
+    setCursor(c);
+  }, []);
+
+  const session = useSession({ ws: wsInstance, onSharedCursor });
 
   useEffect(() => { cursorRef.current = cursor; }, [cursor]);
   useEffect(() => { isLiveRef.current = isLive; }, [isLive]);
@@ -124,6 +138,8 @@ export function App() {
         setSampleRunning(msg.running);
       }
     });
+    wsRef.current = ws;
+    setWsInstance(ws);
     ws.onopen = () => setWsConnected(true);
     ws.onclose = () => setWsConnected(false);
     ws.onerror = () => setWsConnected(false);
@@ -134,6 +150,7 @@ export function App() {
       if (abortRef.current) abortRef.current.abort();
       if (versionsAbortRef.current) versionsAbortRef.current.abort();
       if (fetchTimerRef.current !== null) window.clearTimeout(fetchTimerRef.current);
+      if (broadcastTimerRef.current !== null) window.clearTimeout(broadcastTimerRef.current);
     };
   }, [loadView, scheduleViewLoad]);
 
@@ -154,8 +171,25 @@ export function App() {
 
   const handleCursorChange = useCallback((c: ReplayCursor) => {
     setIsLive(false);
+    session.setFollowing(false);
     setCursor(c);
-  }, []);
+  }, [session]);
+
+  useEffect(() => {
+    if (!session.isLeader || session.followState !== 'following') return;
+    if (broadcastTimerRef.current !== null) window.clearTimeout(broadcastTimerRef.current);
+    broadcastTimerRef.current = window.setTimeout(() => {
+      broadcastTimerRef.current = null;
+      if (wsRef.current && session.fencingToken !== null) {
+        sendWs(wsRef.current, {
+          type: 'advance-cursor',
+          clientId: session.clientId,
+          fencingToken: session.fencingToken,
+          cursor,
+        });
+      }
+    }, 250);
+  }, [cursor, session]);
 
   const goLive = useCallback(() => {
     setIsLive(true);
@@ -230,6 +264,8 @@ export function App() {
         )}
       </header>
 
+      <SessionBar session={session} />
+
       <SpanList spans={view.spans} selected={selected} onSelect={handleSelect} />
 
       <div className="panel view-panel">
@@ -247,7 +283,14 @@ export function App() {
 
       {showSnapshots && (
         <div className="snapshot-drawer">
-          <SnapshotPanel cursor={cursor} onJumpTo={handleJumpToCursor} />
+          <SnapshotPanel
+            cursor={cursor}
+            onJumpTo={handleJumpToCursor}
+            fencing={session.fencingToken !== null ? { clientId: session.clientId, token: session.fencingToken } : null}
+            leaderName={session.leaderName}
+            isLeader={session.isLeader}
+            leaseActive={!!session.lease}
+          />
         </div>
       )}
 

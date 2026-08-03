@@ -8,6 +8,10 @@ import type {
   IncidentSnapshot,
   SnapshotDiff,
   SnapshotSlot,
+  LeaseState,
+  SessionNote,
+  LeaseError,
+  WsClientMessage,
 } from '@shared/contracts.js';
 
 export interface SpanVersionsResponse {
@@ -86,11 +90,19 @@ export function createSnapshot(
   cursor: ReplayCursor,
   label?: string,
   notes?: string,
+  fencing?: { clientId: string; token: number } | null,
 ): Promise<IncidentSnapshot> {
   return jsonRequest<IncidentSnapshot>('/api/snapshots', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ slot, cursor, label, notes: notes ?? '' }),
+    body: JSON.stringify({
+      slot,
+      cursor,
+      label,
+      notes: notes ?? '',
+      fencingToken: fencing?.token ?? null,
+      clientId: fencing?.clientId ?? null,
+    }),
   });
 }
 
@@ -120,4 +132,87 @@ export function compareSnapshots(aId?: string, bId?: string): Promise<SnapshotDi
   if (bId) params.set('b', bId);
   const qs = params.toString();
   return jsonRequest<SnapshotDiff>(`/api/snapshots/compare${qs ? `?${qs}` : ''}`);
+}
+
+export interface SessionState {
+  lease: LeaseState | null;
+  sharedCursor: ReplayCursor;
+  notes: SessionNote[];
+}
+
+export interface AcquireResponse {
+  ok: boolean;
+  lease: LeaseState | null;
+  error: LeaseError | null;
+  acquired: boolean;
+}
+
+export function fetchSession(): Promise<SessionState> {
+  return jsonRequest('/api/session');
+}
+
+export function acquireLease(clientId: string, clientName: string, ttlMs = 30000): Promise<AcquireResponse> {
+  return jsonRequest('/api/session/lease', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ clientId, clientName, ttlMs }),
+  });
+}
+
+export function renewLease(clientId: string, fencingToken: number): Promise<AcquireResponse> {
+  return jsonRequest('/api/session/lease/renew', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ clientId, fencingToken }),
+  });
+}
+
+export function releaseLease(clientId: string, fencingToken: number): Promise<{ ok: boolean }> {
+  return jsonRequest('/api/session/lease/release', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ clientId, fencingToken }),
+  });
+}
+
+export async function advanceSharedCursor(
+  clientId: string,
+  fencingToken: number,
+  cursor: ReplayCursor,
+): Promise<{ ok: boolean; error?: LeaseError }> {
+  try {
+    await jsonRequest('/api/session/cursor', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ clientId, fencingToken, cursor }),
+    });
+    return { ok: true };
+  } catch (e) {
+    try {
+      const parsed = JSON.parse((e as Error).message.replace(/^HTTP \d+: /, '')) as { error?: LeaseError };
+      if (parsed.error) return { ok: false, error: parsed.error };
+    } catch { /* fall through */ }
+    return { ok: false };
+  }
+}
+
+export function addSessionNote(note: {
+  clientId: string;
+  clientSeq: number;
+  authorName: string;
+  text: string;
+  snapshotId: string | null;
+  createdAt?: number;
+}): Promise<{ ok: boolean; note: SessionNote; isNew: boolean }> {
+  return jsonRequest('/api/session/notes', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ note }),
+  });
+}
+
+export function sendWs(ws: WebSocket, msg: WsClientMessage): void {
+  if (ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify(msg));
+  }
 }

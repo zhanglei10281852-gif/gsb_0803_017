@@ -9,6 +9,7 @@ import type {
   IncidentSnapshot,
   SnapshotSlot,
   SnapshotDiff,
+  LeaseError,
 } from '../shared/contracts.js';
 import {
   buildReplayView,
@@ -20,21 +21,39 @@ import {
 } from '../shared/projection.js';
 import type { LedgerStore } from './db.js';
 import { SnapshotStore } from './snapshotStore.js';
+import { SessionStore } from './sessionStore.js';
+import { SessionService } from './session.js';
 
 export type EngineListener = (record: LedgerRecord, head: ReplayCursor) => void;
+
+export class FencingError extends Error {
+  readonly leaseError: LeaseError;
+  constructor(leaseError: LeaseError) {
+    super(leaseError.message);
+    this.name = 'FencingError';
+    this.leaseError = leaseError;
+  }
+}
 
 export class ReplayEngine {
   private readonly store: LedgerStore;
   private readonly snapshots: SnapshotStore;
+  private readonly session: SessionService;
   private records: LedgerRecord[];
   private readonly emitter: EventEmitter;
 
-  constructor(store: LedgerStore) {
+  constructor(store: LedgerStore, clock?: () => number) {
     this.store = store;
     this.records = store.getAllRecords();
-    this.snapshots = new SnapshotStore(store.getDatabase());
+    const db = store.getDatabase();
+    this.snapshots = new SnapshotStore(db);
+    this.session = new SessionService(new SessionStore(db), clock);
     this.emitter = new EventEmitter();
     this.emitter.setMaxListeners(0);
+  }
+
+  getSession(): SessionService {
+    return this.session;
   }
 
   ingest(event: RawSpanEvent): LedgerRecord {
@@ -107,7 +126,15 @@ export class ReplayEngine {
     label: string,
     cursor: ReplayCursor,
     notes: string,
+    fencing?: { clientId: string | null; token: number | null } | null,
   ): IncidentSnapshot {
+    const fencingErr = this.session.validateFencing(
+      fencing?.clientId ?? null,
+      fencing?.token ?? null,
+    );
+    if (fencingErr) {
+      throw new FencingError(fencingErr);
+    }
     const ledgerHead = this.getHead();
     const { digest, visibleRecordCount } = this.computeDigest(cursor);
     return this.snapshots.create({
@@ -158,6 +185,7 @@ export class ReplayEngine {
 
   close(): void {
     this.emitter.removeAllListeners();
+    this.session.close();
     this.store.close();
   }
 }

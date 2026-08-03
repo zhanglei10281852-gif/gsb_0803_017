@@ -5,8 +5,9 @@ import { extname, join, normalize } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { WebSocketServer, type WebSocket } from 'ws';
 import type { ReplayEngine } from './replay.js';
+import { FencingError } from './replay.js';
 import { parseNdjsonBody } from './ingest.js';
-import type { WsServerMessage } from '../shared/contracts.js';
+import type { WsServerMessage, WsClientMessage } from '../shared/contracts.js';
 import {
   parseReplayCursor,
   parseCreateSnapshotRequest,
@@ -169,12 +170,28 @@ export function createAppServer(ctx: AppContext) {
           sendJson(res, 400, { error: (e as Error).message });
           return;
         }
-        const snapshot = engine.createSnapshot(
-          req2.slot,
-          req2.label ?? (req2.slot === 'A' ? 'Moment A' : 'Moment B'),
-          req2.cursor,
-          req2.notes ?? '',
-        );
+        const fencingToken = typeof (body as Record<string, unknown>).fencingToken === 'number'
+          ? ((body as Record<string, unknown>).fencingToken as number)
+          : null;
+        const clientId = typeof (body as Record<string, unknown>).clientId === 'string'
+          ? ((body as Record<string, unknown>).clientId as string)
+          : null;
+        let snapshot;
+        try {
+          snapshot = engine.createSnapshot(
+            req2.slot,
+            req2.label ?? (req2.slot === 'A' ? 'Moment A' : 'Moment B'),
+            req2.cursor,
+            req2.notes ?? '',
+            { clientId, token: fencingToken },
+          );
+        } catch (e) {
+          if (e instanceof FencingError) {
+            sendJson(res, 409, { error: e.leaseError });
+            return;
+          }
+          throw e;
+        }
         sendJson(res, 201, snapshot);
         return;
       }
@@ -250,6 +267,108 @@ export function createAppServer(ctx: AppContext) {
         return;
       }
 
+      if (pathname === '/api/session' && method === 'GET') {
+        const session = engine.getSession();
+        sendJson(res, 200, {
+          lease: session.getLease(),
+          sharedCursor: session.getSharedCursor(),
+          notes: session.getNotes(),
+        });
+        return;
+      }
+
+      if (pathname === '/api/session/lease' && method === 'POST') {
+        const text = await readBody(req);
+        let body: Record<string, unknown> = {};
+        try { body = JSON.parse(text) as Record<string, unknown>; } catch { /* empty */ }
+        const clientId = typeof body.clientId === 'string' ? body.clientId : '';
+        const clientName = typeof body.clientName === 'string' ? body.clientName : 'anonymous';
+        const ttlMs = typeof body.ttlMs === 'number' ? body.ttlMs : 30000;
+        if (!clientId) {
+          sendJson(res, 400, { error: 'clientId required' });
+          return;
+        }
+        const result = engine.getSession().acquire(clientId, clientName, ttlMs);
+        sendJson(res, result.ok ? 200 : 409, result);
+        return;
+      }
+
+      if (pathname === '/api/session/lease/renew' && method === 'POST') {
+        const text = await readBody(req);
+        let body: Record<string, unknown> = {};
+        try { body = JSON.parse(text) as Record<string, unknown>; } catch { /* empty */ }
+        const clientId = typeof body.clientId === 'string' ? body.clientId : '';
+        const fencingToken = typeof body.fencingToken === 'number' ? body.fencingToken : -1;
+        const result = engine.getSession().renew(clientId, fencingToken);
+        sendJson(res, result.ok ? 200 : 409, result);
+        return;
+      }
+
+      if (pathname === '/api/session/lease/release' && method === 'POST') {
+        const text = await readBody(req);
+        let body: Record<string, unknown> = {};
+        try { body = JSON.parse(text) as Record<string, unknown>; } catch { /* empty */ }
+        const clientId = typeof body.clientId === 'string' ? body.clientId : '';
+        const fencingToken = typeof body.fencingToken === 'number' ? body.fencingToken : -1;
+        const ok = engine.getSession().release(clientId, fencingToken);
+        sendJson(res, ok ? 200 : 409, { ok });
+        return;
+      }
+
+      if (pathname === '/api/session/cursor' && method === 'POST') {
+        const text = await readBody(req);
+        let body: Record<string, unknown> = {};
+        try { body = JSON.parse(text) as Record<string, unknown>; } catch (e) {
+          sendJson(res, 400, { error: (e as Error).message });
+          return;
+        }
+        const clientId = typeof body.clientId === 'string' ? body.clientId : '';
+        const fencingToken = typeof body.fencingToken === 'number' ? body.fencingToken : null;
+        let cursor;
+        try {
+          cursor = parseReplayCursor(body.cursor);
+        } catch (e) {
+          sendJson(res, 400, { error: (e as Error).message });
+          return;
+        }
+        const result = engine.getSession().advanceCursor(clientId, fencingToken ?? -1, cursor);
+        if (!result.ok) {
+          sendJson(res, 409, { error: result.error });
+          return;
+        }
+        sendJson(res, 200, { ok: true, cursor });
+        return;
+      }
+
+      if (pathname === '/api/session/notes' && method === 'GET') {
+        sendJson(res, 200, { notes: engine.getSession().getNotes() });
+        return;
+      }
+
+      if (pathname === '/api/session/notes' && method === 'POST') {
+        const text = await readBody(req);
+        let body: Record<string, unknown> = {};
+        try { body = JSON.parse(text) as Record<string, unknown>; } catch (e) {
+          sendJson(res, 400, { error: (e as Error).message });
+          return;
+        }
+        const note = body.note as Record<string, unknown> | undefined;
+        if (!note || typeof note.clientId !== 'string' || typeof note.clientSeq !== 'number' || typeof note.text !== 'string') {
+          sendJson(res, 400, { error: 'note requires clientId, clientSeq, text' });
+          return;
+        }
+        const result = engine.getSession().addNote({
+          clientId: note.clientId,
+          clientSeq: note.clientSeq,
+          authorName: typeof note.authorName === 'string' ? note.authorName : note.clientId,
+          text: note.text,
+          snapshotId: typeof note.snapshotId === 'string' ? note.snapshotId : null,
+          createdAt: typeof note.createdAt === 'number' ? note.createdAt : undefined,
+        });
+        sendJson(res, 200, { ok: true, note: result.note, isNew: result.isNew });
+        return;
+      }
+
       if (pathname === '/api/health') {
         sendJson(res, 200, { ok: true, records: engine.totalRecords() });
         return;
@@ -278,20 +397,111 @@ export function createAppServer(ctx: AppContext) {
 
   wss.on('connection', (ws) => {
     sockets.add(ws);
+    const session = engine.getSession();
     const head = engine.getHead();
     ws.send(JSON.stringify({ type: 'snapshot', head, totalLedgerRecords: engine.totalRecords() } satisfies WsServerMessage));
+    ws.send(JSON.stringify({
+      type: 'session-state',
+      lease: session.getLease(),
+      notes: session.getNotes(),
+      now: Date.now(),
+      selfClientId: null,
+    } satisfies WsServerMessage));
+
     const unsubscribe = engine.subscribe((record, h) => {
       if (ws.readyState === ws.OPEN) {
         ws.send(JSON.stringify({ type: 'record', record, head: h } satisfies WsServerMessage));
       }
     });
+
+    const unsubscribeSession = session.subscribe((event) => {
+      let msg: WsServerMessage | null = null;
+      if (event.kind === 'lease') {
+        msg = { type: 'lease-changed', lease: event.lease, reason: event.reason } satisfies WsServerMessage;
+      } else if (event.kind === 'cursor') {
+        msg = {
+          type: 'cursor-broadcast',
+          cursor: event.cursor,
+          fencingToken: event.fencingToken,
+          byClientId: event.byClientId,
+        } satisfies WsServerMessage;
+      } else if (event.kind === 'notes') {
+        msg = { type: 'notes-appended', notes: event.notes } satisfies WsServerMessage;
+      }
+      if (msg && ws.readyState === ws.OPEN) {
+        ws.send(JSON.stringify(msg));
+      }
+    });
+
+    ws.on('message', (data) => {
+      let parsed: WsClientMessage;
+      try {
+        parsed = JSON.parse(data.toString()) as WsClientMessage;
+      } catch {
+        return;
+      }
+      try {
+        switch (parsed.type) {
+          case 'acquire-lease': {
+            const result = session.acquire(
+              parsed.clientId,
+              parsed.clientName,
+              parsed.ttlMs,
+            );
+            ws.send(JSON.stringify({
+              type: result.ok ? 'lease-acquired' : 'lease-error',
+              ...(result.ok
+                ? { lease: result.lease }
+                : { error: result.error }),
+            } as WsServerMessage));
+            break;
+          }
+          case 'renew-lease': {
+            const result = session.renew(parsed.clientId, parsed.fencingToken);
+            if (!result.ok && result.error) {
+              ws.send(JSON.stringify({ type: 'lease-error', error: result.error } satisfies WsServerMessage));
+            }
+            break;
+          }
+          case 'release-lease': {
+            session.release(parsed.clientId, parsed.fencingToken);
+            break;
+          }
+          case 'advance-cursor': {
+            const result = session.advanceCursor(parsed.clientId, parsed.fencingToken, parsed.cursor);
+            if (!result.ok && result.error) {
+              ws.send(JSON.stringify({ type: 'lease-error', error: result.error } satisfies WsServerMessage));
+            }
+            break;
+          }
+          case 'add-note': {
+            session.addNote({
+              clientId: parsed.note.clientId,
+              clientSeq: parsed.note.clientSeq,
+              authorName: parsed.note.authorName,
+              text: parsed.note.text,
+              snapshotId: parsed.note.snapshotId,
+              createdAt: parsed.note.createdAt,
+            });
+            break;
+          }
+          default:
+            break;
+        }
+      } catch {
+        // ignore malformed ws messages
+      }
+    });
+
     ws.on('close', () => {
       sockets.delete(ws);
       unsubscribe();
+      unsubscribeSession();
     });
     ws.on('error', () => {
       sockets.delete(ws);
       unsubscribe();
+      unsubscribeSession();
     });
   });
 

@@ -172,3 +172,94 @@ export interface LiveLedgerEvent {
   readonly totalRecords: number;
   readonly serverTime: number;
 }
+
+export interface SnapshotDigest {
+  readonly ledgerHighWatermark: {
+    readonly maxIngestSequence: number;
+    readonly maxEventTime: number;
+    readonly totalRecords: number;
+  };
+  readonly cursor: ReplayCursor;
+  readonly visibleRecordCount: number;
+  readonly recordsDigest: string;
+  readonly viewFingerprint: string;
+  readonly spanCount: number;
+  readonly traceCount: number;
+  readonly errorPathCount: number;
+}
+
+export type SpanDiffKind = 'added' | 'removed' | 'status-changed' | 'revision-changed';
+
+export interface SpanDiffEntry {
+  readonly traceId: string;
+  readonly spanId: string;
+  readonly service: string;
+  readonly operation: string;
+  readonly kind: SpanDiffKind;
+  readonly beforeRevision: number | null;
+  readonly afterRevision: number | null;
+  readonly beforeStatus: SpanStatus | null;
+  readonly afterStatus: SpanStatus | null;
+  readonly beforeErrorMessage: string | null;
+  readonly afterErrorMessage: string | null;
+  readonly detail: string;
+}
+
+export type CriticalPathChangeKind =
+  | 'path-extended'
+  | 'path-shortened'
+  | 'origin-changed'
+  | 'service-set-changed';
+
+export interface CriticalPathDiff {
+  readonly traceId: string;
+  readonly key: string;
+  readonly originSpanId: string | null;
+  readonly beforePath: readonly string[];
+  readonly afterPath: readonly string[];
+  readonly beforeAffectedServices: readonly string[];
+  readonly afterAffectedServices: readonly string[];
+  readonly change: CriticalPathChangeKind;
+}
+
+export interface IncidentDiff {
+  readonly added: readonly SpanDiffEntry[];
+  readonly removed: readonly SpanDiffEntry[];
+  readonly statusChanged: readonly SpanDiffEntry[];
+  readonly revisionChanged: readonly SpanDiffEntry[];
+  readonly criticalPathChanges: readonly CriticalPathDiff[];
+  readonly summary: {
+    readonly addedCount: number;
+    readonly removedCount: number;
+    readonly statusChangedCount: number;
+    readonly revisionChangedCount: number;
+    readonly criticalPathChangeCount: number;
+  };
+}
+
+export interface IncidentSnapshot {
+  readonly contractVersion: typeof CONTRACT_VERSION;
+  readonly id: string;
+  readonly createdAt: number;
+  readonly labelA: string;
+  readonly labelB: string;
+  readonly cursorA: ReplayCursor;
+  readonly cursorB: ReplayCursor;
+  readonly digestA: SnapshotDigest;
+  readonly digestB: SnapshotDigest;
+  readonly diff: IncidentDiff;
+  readonly notes: string;
+  readonly sealed: true;
+}
+
+export interface CreateSnapshotRequest {
+  readonly labelA?: string;
+  readonly labelB?: string;
+  readonly cursorA: ReplayCursor;
+  readonly cursorB: ReplayCursor;
+  readonly notes?: string;
+}
+
+export interface UpdateSnapshotNotesRequest {
+  readonly notes: string;
+}

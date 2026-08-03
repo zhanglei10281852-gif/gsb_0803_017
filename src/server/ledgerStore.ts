@@ -1,7 +1,12 @@
-import Database from 'better-sqlite3';
-import { existsSync, mkdirSync } from 'fs';
-import { dirname, resolve } from 'path';
-import { LedgerRecord, SpanAttributes, SpanEvent } from '../shared/contracts';
+import Database from "better-sqlite3";
+import { existsSync, mkdirSync } from "fs";
+import { dirname, resolve } from "path";
+import {
+  IncidentSnapshot,
+  LedgerRecord,
+  SpanAttributes,
+  SpanEvent,
+} from "../shared/contracts";
 
 interface LedgerRow {
   ingest_sequence: number;
@@ -10,8 +15,8 @@ interface LedgerRow {
   parent_span_id: string | null;
   service: string;
   operation: string;
-  kind: LedgerRecord['kind'];
-  status: LedgerRecord['status'];
+  kind: LedgerRecord["kind"];
+  status: LedgerRecord["status"];
   start_time: number;
   end_time: number;
   revision: number;
@@ -50,7 +55,7 @@ function rowToRecord(row: LedgerRow): LedgerRecord {
     eventTime: row.event_time,
     errorMessage: row.error_message,
     attributes: parsedAttributes,
-    receivedAt: row.received_at
+    receivedAt: row.received_at,
   };
 }
 
@@ -62,6 +67,10 @@ export class LedgerStore {
   private readonly rangeStmt: Database.Statement;
   private readonly versionsStmt: Database.Statement;
   private readonly infoStmt: Database.Statement;
+  private readonly insertSnapshotStmt: Database.Statement;
+  private readonly listSnapshotsStmt: Database.Statement;
+  private readonly getSnapshotStmt: Database.Statement;
+  private readonly updateNotesStmt: Database.Statement;
 
   constructor(dbPath: string) {
     const absolutePath = resolve(dbPath);
@@ -70,8 +79,8 @@ export class LedgerStore {
       mkdirSync(parent, { recursive: true });
     }
     this.db = new Database(absolutePath);
-    this.db.pragma('journal_mode = WAL');
-    this.db.pragma('synchronous = NORMAL');
+    this.db.pragma("journal_mode = WAL");
+    this.db.pragma("synchronous = NORMAL");
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS span_ledger (
         ingest_sequence INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -93,6 +102,21 @@ export class LedgerStore {
       CREATE INDEX IF NOT EXISTS idx_ledger_trace_span ON span_ledger(trace_id, span_id);
       CREATE INDEX IF NOT EXISTS idx_ledger_ingest ON span_ledger(ingest_sequence);
       CREATE INDEX IF NOT EXISTS idx_ledger_event_time ON span_ledger(event_time);
+
+      CREATE TABLE IF NOT EXISTS incident_snapshots (
+        id TEXT PRIMARY KEY,
+        created_at INTEGER NOT NULL,
+        label_a TEXT NOT NULL,
+        label_b TEXT NOT NULL,
+        cursor_a TEXT NOT NULL,
+        cursor_b TEXT NOT NULL,
+        digest_a TEXT NOT NULL,
+        digest_b TEXT NOT NULL,
+        diff TEXT NOT NULL,
+        notes TEXT NOT NULL,
+        sealed INTEGER NOT NULL DEFAULT 1
+      );
+      CREATE INDEX IF NOT EXISTS idx_snapshots_created ON incident_snapshots(created_at);
     `);
 
     this.insertStmt = this.db.prepare(`
@@ -102,15 +126,15 @@ export class LedgerStore {
       VALUES (@trace_id, @span_id, @parent_span_id, @service, @operation, @kind, @status,
               @start_time, @end_time, @revision, @event_time, @error_message, @attributes, @received_at)
     `);
-    this.lastSeqStmt = this.db.prepare('SELECT last_insert_rowid() AS seq');
+    this.lastSeqStmt = this.db.prepare("SELECT last_insert_rowid() AS seq");
     this.allStmt = this.db.prepare(
-      'SELECT * FROM span_ledger ORDER BY ingest_sequence ASC'
+      "SELECT * FROM span_ledger ORDER BY ingest_sequence ASC",
     );
     this.rangeStmt = this.db.prepare(
-      'SELECT * FROM span_ledger WHERE ingest_sequence <= ? ORDER BY ingest_sequence ASC'
+      "SELECT * FROM span_ledger WHERE ingest_sequence <= ? ORDER BY ingest_sequence ASC",
     );
     this.versionsStmt = this.db.prepare(
-      'SELECT * FROM span_ledger WHERE trace_id = ? AND span_id = ? ORDER BY ingest_sequence ASC'
+      "SELECT * FROM span_ledger WHERE trace_id = ? AND span_id = ? ORDER BY ingest_sequence ASC",
     );
     this.infoStmt = this.db.prepare(`
       SELECT
@@ -121,6 +145,20 @@ export class LedgerStore {
         COALESCE(MAX(event_time), 0) AS max_event
       FROM span_ledger
     `);
+    this.insertSnapshotStmt = this.db.prepare(`
+      INSERT INTO incident_snapshots
+        (id, created_at, label_a, label_b, cursor_a, cursor_b, digest_a, digest_b, diff, notes, sealed)
+      VALUES (@id, @created_at, @label_a, @label_b, @cursor_a, @cursor_b, @digest_a, @digest_b, @diff, @notes, 1)
+    `);
+    this.listSnapshotsStmt = this.db.prepare(
+      "SELECT * FROM incident_snapshots ORDER BY created_at DESC, id DESC",
+    );
+    this.getSnapshotStmt = this.db.prepare(
+      "SELECT * FROM incident_snapshots WHERE id = ?",
+    );
+    this.updateNotesStmt = this.db.prepare(
+      "UPDATE incident_snapshots SET notes = @notes WHERE id = @id",
+    );
   }
 
   append(events: readonly SpanEvent[], now: number = Date.now()): AppendResult {
@@ -142,7 +180,7 @@ export class LedgerStore {
           event_time: event.eventTime,
           error_message: event.errorMessage ?? null,
           attributes: JSON.stringify(event.attributes ?? {}),
-          received_at: receivedAt
+          received_at: receivedAt,
         });
         const lastRow = this.lastSeqStmt.get() as { seq: number };
         const lastSeq = lastRow.seq;
@@ -161,7 +199,7 @@ export class LedgerStore {
           eventTime: event.eventTime,
           errorMessage: event.errorMessage ?? null,
           attributes: event.attributes ?? {},
-          receivedAt
+          receivedAt,
         });
       }
     });
@@ -197,11 +235,72 @@ export class LedgerStore {
       minIngestSequence: row.min_seq,
       maxIngestSequence: row.max_seq,
       minEventTime: row.min_event,
-      maxEventTime: row.max_event
+      maxEventTime: row.max_event,
     };
   }
 
   close(): void {
     this.db.close();
   }
+
+  saveSnapshot(snapshot: IncidentSnapshot): void {
+    this.insertSnapshotStmt.run({
+      id: snapshot.id,
+      created_at: snapshot.createdAt,
+      label_a: snapshot.labelA,
+      label_b: snapshot.labelB,
+      cursor_a: JSON.stringify(snapshot.cursorA),
+      cursor_b: JSON.stringify(snapshot.cursorB),
+      digest_a: JSON.stringify(snapshot.digestA),
+      digest_b: JSON.stringify(snapshot.digestB),
+      diff: JSON.stringify(snapshot.diff),
+      notes: snapshot.notes
+    });
+  }
+
+  listSnapshots(): IncidentSnapshot[] {
+    const rows = this.listSnapshotsStmt.all() as SnapshotRow[];
+    return rows.map(rowToSnapshot);
+  }
+
+  getSnapshot(id: string): IncidentSnapshot | null {
+    const row = this.getSnapshotStmt.get(id) as SnapshotRow | undefined;
+    return row ? rowToSnapshot(row) : null;
+  }
+
+  updateSnapshotNotes(id: string, notes: string): IncidentSnapshot | null {
+    this.updateNotesStmt.run({ id, notes });
+    return this.getSnapshot(id);
+  }
+}
+
+interface SnapshotRow {
+  id: string;
+  created_at: number;
+  label_a: string;
+  label_b: string;
+  cursor_a: string;
+  cursor_b: string;
+  digest_a: string;
+  digest_b: string;
+  diff: string;
+  notes: string;
+  sealed: number;
+}
+
+function rowToSnapshot(row: SnapshotRow): IncidentSnapshot {
+  return {
+    contractVersion: 1,
+    id: row.id,
+    createdAt: row.created_at,
+    labelA: row.label_a,
+    labelB: row.label_b,
+    cursorA: JSON.parse(row.cursor_a) as IncidentSnapshot['cursorA'],
+    cursorB: JSON.parse(row.cursor_b) as IncidentSnapshot['cursorB'],
+    digestA: JSON.parse(row.digest_a) as IncidentSnapshot['digestA'],
+    digestB: JSON.parse(row.digest_b) as IncidentSnapshot['digestB'],
+    diff: JSON.parse(row.diff) as IncidentSnapshot['diff'],
+    notes: row.notes,
+    sealed: true
+  };
 }

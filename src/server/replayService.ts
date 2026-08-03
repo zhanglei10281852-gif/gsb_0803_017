@@ -1,15 +1,19 @@
-import { EventEmitter } from 'events';
+import { randomUUID } from "crypto";
+import { EventEmitter } from "events";
 import {
+  CreateSnapshotRequest,
+  IncidentSnapshot,
   IngestResponse,
   LedgerRecord,
   LiveLedgerEvent,
   ReplayCursor,
   ReplayView,
   SpanDetail,
-  SpanEvent
-} from '../shared/contracts';
-import { LedgerStore } from './ledgerStore';
-import { ReplayEngine } from './replayEngine';
+  SpanEvent,
+} from "../shared/contracts";
+import { LedgerStore } from "./ledgerStore";
+import { ReplayEngine } from "./replayEngine";
+import { buildSnapshot } from "./snapshotEngine";
 
 export class ReplayService {
   private records: LedgerRecord[];
@@ -29,7 +33,9 @@ export class ReplayService {
   }
 
   get maxIngestSequence(): number {
-    return this.records.length === 0 ? 0 : this.records[this.records.length - 1]!.ingestSequence;
+    return this.records.length === 0
+      ? 0
+      : this.records[this.records.length - 1]!.ingestSequence;
   }
 
   liveCursor(): ReplayCursor {
@@ -40,7 +46,11 @@ export class ReplayService {
     return this.engine.buildView(cursor, live);
   }
 
-  buildSpanDetail(traceId: string, spanId: string, cursor: ReplayCursor): SpanDetail | null {
+  buildSpanDetail(
+    traceId: string,
+    spanId: string,
+    cursor: ReplayCursor,
+  ): SpanDetail | null {
     return this.engine.buildSpanDetail(traceId, spanId, cursor);
   }
 
@@ -52,7 +62,7 @@ export class ReplayService {
         rejected: 0,
         firstIngestSequence: null,
         lastIngestSequence: null,
-        errors: []
+        errors: [],
       };
     }
     const result = this.ledger.append(events);
@@ -65,12 +75,43 @@ export class ReplayService {
       rejected: 0,
       firstIngestSequence: first.ingestSequence,
       lastIngestSequence: last.ingestSequence,
-      errors: []
+      errors: [],
     };
   }
 
   close(): void {
     this.ledger.close();
+  }
+
+  createSnapshot(
+    request: CreateSnapshotRequest,
+    now: number = Date.now(),
+  ): IncidentSnapshot {
+    const snapshot = buildSnapshot(
+      randomUUID(),
+      now,
+      request.labelA ?? "A",
+      request.labelB ?? "B",
+      request.cursorA,
+      request.cursorB,
+      request.notes ?? "",
+      this.engine,
+      this.records,
+    );
+    this.ledger.saveSnapshot(snapshot);
+    return snapshot;
+  }
+
+  listSnapshots(): IncidentSnapshot[] {
+    return this.ledger.listSnapshots();
+  }
+
+  getSnapshot(id: string): IncidentSnapshot | null {
+    return this.ledger.getSnapshot(id);
+  }
+
+  updateSnapshotNotes(id: string, notes: string): IncidentSnapshot | null {
+    return this.ledger.updateSnapshotNotes(id, notes);
   }
 }
 

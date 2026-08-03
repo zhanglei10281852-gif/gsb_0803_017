@@ -1,0 +1,13 @@
+{
+  "name": "@replay/sample",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "stream": "node --import tsx src/stream.ts"
+  },
+  "dependencies": {
+    "@replay/shared": "*"
+  }
+}

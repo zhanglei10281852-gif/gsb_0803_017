@@ -8,8 +8,16 @@ import { Ledger } from './ledger';
 import { parseNdjson } from '../shared/ndjson';
 import { projectView } from '../shared/projection';
 import {
+  compareSnapshots,
+  listSnapshots,
+  loadSnapshotView,
+  sealSnapshot,
+  verifySnapshotDigest,
+} from './snapshots';
+import {
   CONTRACT_VERSION,
   ReplayCursor,
+  SealSnapshotRequest,
   type IngestResult,
   type LiveHello,
   type LiveUpdate,
@@ -90,6 +98,62 @@ export function buildApp(options: BuildAppOptions): AppBundle {
     }
     const view = viewAt(ledger, parsed.data);
     return reply.send(view);
+  });
+
+  // --- Snapshots: seal the current cursor as an immutable incident artifact. ---
+  app.post('/api/snapshots', async (req, reply) => {
+    const parsed = SealSnapshotRequest.safeParse(req.body);
+    if (!parsed.success) {
+      return reply.status(400).send({ error: 'invalid snapshot request', issues: parsed.error.issues });
+    }
+    const sealed = sealSnapshot(ledger, parsed.data, Date.now());
+    return reply.status(201).send(sealed);
+  });
+
+  // List all sealed snapshots (metadata + provenance).
+  app.get('/api/snapshots', async () => ({
+    contractVersion: CONTRACT_VERSION,
+    snapshots: listSnapshots(ledger),
+  }));
+
+  // Load one sealed snapshot together with its reproduced frozen view.
+  app.get('/api/snapshots/:id', async (req, reply) => {
+    const id = Number((req.params as { id: string }).id);
+    if (!Number.isInteger(id) || id <= 0) {
+      return reply.status(400).send({ error: 'invalid snapshot id' });
+    }
+    const loaded = loadSnapshotView(ledger, id);
+    if (loaded === null) return reply.status(404).send({ error: 'snapshot not found' });
+    return reply.send(loaded);
+  });
+
+  // Verify a snapshot still reproduces its sealed digest (immutability proof).
+  app.get('/api/snapshots/:id/verify', async (req, reply) => {
+    const id = Number((req.params as { id: string }).id);
+    if (!Number.isInteger(id) || id <= 0) {
+      return reply.status(400).send({ error: 'invalid snapshot id' });
+    }
+    const loaded = loadSnapshotView(ledger, id);
+    if (loaded === null) return reply.status(404).send({ error: 'snapshot not found' });
+    return reply.send({
+      contractVersion: CONTRACT_VERSION,
+      id,
+      digest: loaded.snapshot.provenance.digest,
+      valid: verifySnapshotDigest(ledger, id),
+    });
+  });
+
+  // --- Compare: deterministic A -> B diff of two sealed snapshots. ---
+  app.get('/api/compare', async (req, reply) => {
+    const q = req.query as Record<string, string | undefined>;
+    const fromId = Number(q.from);
+    const toId = Number(q.to);
+    if (!Number.isInteger(fromId) || !Number.isInteger(toId) || fromId <= 0 || toId <= 0) {
+      return reply.status(400).send({ error: 'from and to snapshot ids are required' });
+    }
+    const comparison = compareSnapshots(ledger, fromId, toId);
+    if (comparison === null) return reply.status(404).send({ error: 'snapshot not found' });
+    return reply.send(comparison);
   });
 
   // --- Live follow: push the ledger head as new records arrive. ---

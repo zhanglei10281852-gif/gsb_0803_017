@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { ProjectionView, ProjectedSpan, ReplayCursor } from '../shared/contract';
 import { fetchBounds, fetchView, openLive, type Bounds } from './api';
 import { TopologyScene } from './TopologyScene';
+import { SnapshotPanel } from './SnapshotPanel';
 
 type Mode = 'live' | 'paused';
 
@@ -197,6 +198,8 @@ export function App(): JSX.Element {
               <p className="empty">选择一个 span 查看其当前版本生效的理由</p>
             )}
           </div>
+
+          <SnapshotPanel cursor={cursor} baseEventTimeMs={bounds.minEventTimeMs} />
         </aside>
       </main>
     </div>

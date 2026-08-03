@@ -2,8 +2,18 @@ import type {
   LiveMessage,
   ProjectionView,
   ReplayCursor,
+  IncidentSnapshot,
+  SnapshotView,
+  SnapshotComparison,
 } from '../shared/contract';
-import { LiveMessage as LiveMessageSchema, ProjectionView as ProjectionViewSchema } from '../shared/contract';
+import {
+  LiveMessage as LiveMessageSchema,
+  ProjectionView as ProjectionViewSchema,
+  IncidentSnapshot as IncidentSnapshotSchema,
+  SnapshotView as SnapshotViewSchema,
+  SnapshotComparison as SnapshotComparisonSchema,
+} from '../shared/contract';
+import { z } from 'zod';
 
 /** Fetch the reproducible projection at a cursor. Validates against the contract. */
 export async function fetchView(cursor: ReplayCursor): Promise<ProjectionView> {
@@ -63,4 +73,39 @@ export function openLive(onMessage: (msg: LiveMessage) => void): () => void {
     closed = true;
     socket?.close();
   };
+}
+
+// --- Snapshots & comparison ---
+
+/** Seal the given cursor into an immutable snapshot with an optional note. */
+export async function sealSnapshot(input: {
+  label: string;
+  note: string | null;
+  cursor: ReplayCursor;
+}): Promise<SnapshotView> {
+  const res = await fetch('/api/snapshots', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(input),
+  });
+  if (!res.ok) throw new Error(`seal snapshot failed: ${res.status}`);
+  const json: unknown = await res.json();
+  return SnapshotViewSchema.parse(json);
+}
+
+const SnapshotListSchema = z.object({ snapshots: z.array(IncidentSnapshotSchema) });
+
+export async function listSnapshots(): Promise<IncidentSnapshot[]> {
+  const res = await fetch('/api/snapshots');
+  if (!res.ok) throw new Error(`list snapshots failed: ${res.status}`);
+  const json: unknown = await res.json();
+  return SnapshotListSchema.parse(json).snapshots;
+}
+
+/** Deterministic A -> B comparison of two sealed snapshots. */
+export async function compareSnapshots(fromId: number, toId: number): Promise<SnapshotComparison> {
+  const res = await fetch(`/api/compare?from=${fromId}&to=${toId}`);
+  if (!res.ok) throw new Error(`compare failed: ${res.status}`);
+  const json: unknown = await res.json();
+  return SnapshotComparisonSchema.parse(json);
 }

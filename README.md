@@ -19,24 +19,50 @@
 `ingestSequence` 表达"**当时已经到达了多少知识**"，`eventTimeMs` 表达"**事故时间轴上的某一刻**"。
 两者组合，就能重放"在采集进度 = N 时、看事故第 T 毫秒的拓扑长什么样"。
 
+## 事故快照与对比 (IncidentSnapshot)
+
+复盘时经常要把"两个关键时刻"固定下来比较。快照沿用**同一套** `ReplayCursor`
+和事件修订规则，不另做旁路数据模型：
+
+| 需求 | 实现 |
+| --- | --- |
+| 封存 A、B 两个游标为不可变快照 | `snapshots` 表与账本同库、**只插入不更新**；封存后 cursor/备注/摘要永不改写 |
+| 展示两点间 新增/消失/状态变化/关键路径变化 的 span | `diffSnapshotViews()` 纯函数按 span 键归并、排序输出，确定性 |
+| 附上调查备注 | `note` 随快照一起封存，并纳入摘要计算 |
+| 记录足以证明来源的账本高水位 | `provenance.ledgerHighWater` = 封存时账本的 `maxIngestSequence`（冻结切片） |
+| 确定性摘要 | `sha256(canonicalSnapshotContent(...))`，只依赖账本派生事实，与顺序/时钟无关 |
+| 相同账本+游标重启后同一摘要 | 快照视图 = `projectView(readUpToIngest(highWater), cursor)`，纯函数 + 只追加切片 |
+| 迟到事件产生新快照但不改写旧结果 | 旧快照冻结在其 `highWater` 之下，迟到记录不在切片内；只能封新快照 |
+
+关键点：一个快照被**冻结在它的 `ledgerHighWater`** 上——重建视图时只回放
+`ingestSequence <= highWater` 的记录。因此后续迟到、重复、乱序、重连产生的新记录
+永远进不了这个切片，摘要天然稳定、旧封存结果无法被改写。`GET /api/snapshots/:id/verify`
+可随时重算摘要自证未被篡改。
+
+界面右侧"事故快照对比"面板：拖动时间线到关键时刻 → 填备注 → 封存（自动标 A/B/C…）→
+选定 A、B → 比较，即得带 provenance 与摘要指纹的差异列表。
+
 ## 目录结构
 
 ```
 src/
-  shared/        # 前后端共享的版本化契约 (zod) + 纯投影函数
-    contract.ts    # SpanEventInput / LedgerRecord / ReplayCursor / ProjectionView ...
+  shared/        # 前后端共享的版本化契约 (zod) + 纯投影/快照函数
+    contract.ts    # SpanEventInput / LedgerRecord / ReplayCursor / ProjectionView
+                   #   + IncidentSnapshot / SnapshotComparison / SpanDelta ...
     projection.ts  # projectView(): 唯一的、纯粹的、可复现的视图生成逻辑
+    snapshot.ts    # canonicalSnapshotContent() 摘要内容 + diffSnapshotViews() 对比
     ndjson.ts      # NDJSON 解析/序列化
-  server/        # Fastify：NDJSON 接入 + WS 实时跟随 + 视图查询 + 静态托管
-    ledger.ts      # 只追加的 SQLite 账本
+  server/        # Fastify：NDJSON 接入 + WS 实时跟随 + 视图查询 + 快照/对比 + 静态托管
+    ledger.ts      # 只追加的 SQLite 账本（含只插入的 snapshots 表）
+    snapshots.ts   # 封存/复现/对比/校验 + sha256 摘要 (node:crypto)
     app.ts         # 路由与投影装配（可被测试单独引导）
     main.ts        # npm start 入口
   sample/        # 确定性样例流：制造乱序/重复/修订/重连
-  web/           # React + Three.js 主界面
+  web/           # React + Three.js 主界面 + SnapshotPanel 快照对比面板
 tests/
-  unit/          # 投影语义、样例确定性、契约校验
-  integration/   # 账本 + HTTP 应用 + 重启恢复
-  e2e/           # Playwright：启动 dist 真实服务，真网络接入 + 浏览器交互 + 重开存储
+  unit/          # 投影语义、样例确定性、契约校验、摘要确定性 + diff 分类
+  integration/   # 账本 + HTTP 应用 + 重启恢复 + 快照封存/不可变/重启稳定/对比
+  e2e/           # Playwright：启动 dist 真实服务，真网络接入 + 浏览器交互 + 快照封存/迟到/重启
 ```
 
 ## 命令入口

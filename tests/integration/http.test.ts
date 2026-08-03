@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { buildApp } from '../../src/server/app';
 import { buildScript } from '../../src/sample/script';
 import { toNdjson } from '../../src/shared/ndjson';
-import { ProjectionView, IngestResult } from '../../src/shared/contract';
+import { ProjectionView, IngestResult, SnapshotView, SnapshotComparison } from '../../src/shared/contract';
 
 const cleanups: Array<() => void | Promise<void>> = [];
 afterEach(async () => {
@@ -113,5 +113,139 @@ describe('HTTP app: ingest + view + restart', () => {
     const payments = view.spans.find((s) => s.spanId === 'payments')!;
     expect(payments.revision).toBe(1);
     expect(payments.status).toBe('error');
+  });
+});
+
+describe('HTTP app: snapshots + compare', () => {
+  async function seedApp(dbPath: string) {
+    const { app } = buildApp({ dbPath });
+    cleanups.push(() => app.close());
+    await app.inject({
+      method: 'POST',
+      url: '/api/ingest',
+      headers: { 'content-type': 'application/x-ndjson' },
+      payload: toNdjson(buildScript(1).map((s) => s.event)),
+    });
+    return app;
+  }
+
+  it('seals a snapshot over HTTP and rejects later rewrites of it', async () => {
+    const app = await seedApp(tmpDb());
+    const bounds = (await app.inject({ method: 'GET', url: '/api/bounds' })).json() as {
+      bounds: { maxEventTimeMs: number; maxIngestSequence: number };
+    };
+    const sealRes = await app.inject({
+      method: 'POST',
+      url: '/api/snapshots',
+      headers: { 'content-type': 'application/json' },
+      payload: {
+        label: 'A',
+        note: 'investigating payments',
+        cursor: { eventTimeMs: bounds.bounds.maxEventTimeMs, ingestSequence: bounds.bounds.maxIngestSequence },
+      },
+    });
+    expect(sealRes.statusCode).toBe(201);
+    const sealed = SnapshotView.parse(sealRes.json());
+    expect(sealed.snapshot.provenance.digest).toMatch(/^[0-9a-f]{64}$/);
+
+    // A late event arrives after sealing.
+    await app.inject({
+      method: 'POST',
+      url: '/api/ingest',
+      headers: { 'content-type': 'application/x-ndjson' },
+      payload: toNdjson([
+        {
+          contractVersion: 1,
+          traceId: 'trace-late',
+          spanId: 'late-http',
+          parentSpanId: null,
+          service: 'late',
+          operation: 'op',
+          revision: 0,
+          eventTimeMs: bounds.bounds.maxEventTimeMs + 10,
+          durationMs: 1,
+          status: 'error',
+          revisionReason: null,
+          errorKind: 'Late',
+        },
+      ]),
+    });
+
+    // The sealed snapshot's digest is unchanged and still verifies.
+    const verify = await app.inject({ method: 'GET', url: `/api/snapshots/${sealed.snapshot.id}/verify` });
+    const vbody = verify.json() as { valid: boolean; digest: string };
+    expect(vbody.valid).toBe(true);
+    expect(vbody.digest).toBe(sealed.snapshot.provenance.digest);
+
+    const reloaded = SnapshotView.parse((await app.inject({ method: 'GET', url: `/api/snapshots/${sealed.snapshot.id}` })).json());
+    expect(reloaded.view.spans.find((s) => s.spanId === 'late-http')).toBeUndefined();
+  });
+
+  it('compares two sealed snapshots deterministically (A -> B)', async () => {
+    const app = await seedApp(tmpDb());
+    const bounds = (await app.inject({ method: 'GET', url: '/api/bounds' })).json() as {
+      bounds: { maxEventTimeMs: number; maxIngestSequence: number };
+    };
+    // A: only the first event known. B: everything known.
+    const a = SnapshotView.parse(
+      (
+        await app.inject({
+          method: 'POST',
+          url: '/api/snapshots',
+          headers: { 'content-type': 'application/json' },
+          payload: { label: 'A', note: null, cursor: { eventTimeMs: bounds.bounds.maxEventTimeMs, ingestSequence: 1 } },
+        })
+      ).json(),
+    );
+    const b = SnapshotView.parse(
+      (
+        await app.inject({
+          method: 'POST',
+          url: '/api/snapshots',
+          headers: { 'content-type': 'application/json' },
+          payload: {
+            label: 'B',
+            note: null,
+            cursor: { eventTimeMs: bounds.bounds.maxEventTimeMs, ingestSequence: bounds.bounds.maxIngestSequence },
+          },
+        })
+      ).json(),
+    );
+
+    const cmpRes = await app.inject({ method: 'GET', url: `/api/compare?from=${a.snapshot.id}&to=${b.snapshot.id}` });
+    const cmp = SnapshotComparison.parse(cmpRes.json());
+    // Going from "only 1 record known" to "all known" must add spans.
+    expect(cmp.summary.added).toBeGreaterThan(0);
+    expect(cmp.from.id).toBe(a.snapshot.id);
+    expect(cmp.to.id).toBe(b.snapshot.id);
+  });
+
+  it('persists sealed snapshots and their digests across a restart', async () => {
+    const dbPath = tmpDb();
+    const first = await seedApp(dbPath);
+    const bounds = (await first.inject({ method: 'GET', url: '/api/bounds' })).json() as {
+      bounds: { maxEventTimeMs: number; maxIngestSequence: number };
+    };
+    const sealed = SnapshotView.parse(
+      (
+        await first.inject({
+          method: 'POST',
+          url: '/api/snapshots',
+          headers: { 'content-type': 'application/json' },
+          payload: {
+            label: 'A',
+            note: 'survives restart',
+            cursor: { eventTimeMs: bounds.bounds.maxEventTimeMs, ingestSequence: bounds.bounds.maxIngestSequence },
+          },
+        })
+      ).json(),
+    );
+    await first.close();
+
+    const second = buildApp({ dbPath });
+    cleanups.push(() => second.app.close());
+    const reloaded = SnapshotView.parse((await second.app.inject({ method: 'GET', url: `/api/snapshots/${sealed.snapshot.id}` })).json());
+    expect(reloaded.snapshot.provenance.digest).toBe(sealed.snapshot.provenance.digest);
+    expect(reloaded.snapshot.note).toBe('survives restart');
   });
 });

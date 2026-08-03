@@ -76,6 +76,23 @@ export class Ledger {
 
       CREATE INDEX IF NOT EXISTS idx_ledger_time ON ledger (eventTimeMs);
       CREATE INDEX IF NOT EXISTS idx_ledger_span ON ledger (traceId, spanId, revision);
+
+      -- Immutable sealed snapshots. Rows are insert-only: once sealed, a
+      -- snapshot's cursor, note, frozen high-water and digest never change.
+      -- Late events can only produce NEW snapshots, never rewrite these.
+      CREATE TABLE IF NOT EXISTS snapshots (
+        id             INTEGER PRIMARY KEY AUTOINCREMENT,
+        contractVersion INTEGER NOT NULL,
+        label          TEXT    NOT NULL,
+        note           TEXT,
+        eventTimeMs    INTEGER NOT NULL,
+        ingestSequence INTEGER NOT NULL,
+        ledgerHighWater INTEGER NOT NULL,
+        digestAlgorithm TEXT   NOT NULL,
+        digest         TEXT    NOT NULL,
+        sealedAtMs     INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_snapshots_seq ON snapshots (id);
     `);
 
     const existing = this.db
@@ -178,9 +195,57 @@ export class Ledger {
     return row.n;
   }
 
+  // --- Immutable snapshots (same store, insert-only) ---
+
+  /**
+   * Insert a sealed snapshot. Insert-only: there is no update path, so an
+   * existing snapshot can never be rewritten. Returns the assigned id.
+   */
+  insertSnapshot(row: SnapshotInsert): number {
+    const info = this.db
+      .prepare(
+        `INSERT INTO snapshots (
+           contractVersion, label, note, eventTimeMs, ingestSequence,
+           ledgerHighWater, digestAlgorithm, digest, sealedAtMs
+         ) VALUES (
+           @contractVersion, @label, @note, @eventTimeMs, @ingestSequence,
+           @ledgerHighWater, @digestAlgorithm, @digest, @sealedAtMs
+         )`,
+      )
+      .run(row);
+    return Number(info.lastInsertRowid);
+  }
+
+  getSnapshot(id: number): SnapshotRow | null {
+    const row = this.db.prepare('SELECT * FROM snapshots WHERE id = ?').get(id) as
+      | SnapshotRow
+      | undefined;
+    return row ?? null;
+  }
+
+  listSnapshots(): SnapshotRow[] {
+    return this.db.prepare('SELECT * FROM snapshots ORDER BY id ASC').all() as SnapshotRow[];
+  }
+
   close(): void {
     this.db.close();
   }
+}
+
+export interface SnapshotInsert {
+  contractVersion: number;
+  label: string;
+  note: string | null;
+  eventTimeMs: number;
+  ingestSequence: number;
+  ledgerHighWater: number;
+  digestAlgorithm: string;
+  digest: string;
+  sealedAtMs: number;
+}
+
+export interface SnapshotRow extends SnapshotInsert {
+  id: number;
 }
 
 interface RawRow {

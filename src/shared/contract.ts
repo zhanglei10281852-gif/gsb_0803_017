@@ -161,3 +161,101 @@ export const IngestResult = z.object({
   maxIngestSequence: z.number().int().nonnegative(),
 });
 export type IngestResult = z.infer<typeof IngestResult>;
+
+// ---------------------------------------------------------------------------
+// Incident snapshots: two cursors sealed as immutable artifacts for comparison.
+// ---------------------------------------------------------------------------
+
+/**
+ * Proof-of-origin for a sealed snapshot. The `ledgerHighWater` freezes exactly
+ * how much of the append-only ledger existed when the snapshot was sealed, and
+ * the `digest` is a deterministic fingerprint of the reproduced view over that
+ * frozen slice. Same ledger slice + same cursor always yields the same digest,
+ * so later (late) events can never rewrite an already-sealed result.
+ */
+export const SnapshotProvenance = z.object({
+  /** Max ingestSequence present in the ledger at seal time (the frozen slice). */
+  ledgerHighWater: z.number().int().nonnegative(),
+  digestAlgorithm: z.literal('sha256'),
+  /** Hex sha256 over the canonical, ledger-derived content of the snapshot. */
+  digest: z.string().min(1),
+});
+export type SnapshotProvenance = z.infer<typeof SnapshotProvenance>;
+
+/** An immutable, sealed replay position with investigation metadata. */
+export const IncidentSnapshot = z.object({
+  contractVersion: z.literal(CONTRACT_VERSION),
+  id: z.number().int().positive(),
+  /** Human label, e.g. "A" / "B" or a free-form marker. Sealed at creation. */
+  label: z.string().min(1),
+  /** Investigation note attached at seal time; part of the immutable artifact. */
+  note: z.string().nullable(),
+  cursor: ReplayCursor,
+  provenance: SnapshotProvenance,
+  /** Server wall-clock at seal (diagnostic only; never affects the digest). */
+  sealedAtMs: z.number().int().nonnegative(),
+});
+export type IncidentSnapshot = z.infer<typeof IncidentSnapshot>;
+
+/** A sealed snapshot together with its reproduced, frozen projection. */
+export const SnapshotView = z.object({
+  contractVersion: z.literal(CONTRACT_VERSION),
+  snapshot: IncidentSnapshot,
+  /** Reproduced deterministically from the frozen ledger slice at seal time. */
+  view: ProjectionView,
+});
+export type SnapshotView = z.infer<typeof SnapshotView>;
+
+/** Request body to seal the current cursor into an immutable snapshot. */
+export const SealSnapshotRequest = z.object({
+  label: z.string().min(1),
+  note: z.string().nullable().default(null),
+  cursor: ReplayCursor,
+});
+export type SealSnapshotRequest = z.infer<typeof SealSnapshotRequest>;
+
+/** The resolved facts about one span at a snapshot, used for diffing. */
+export const SpanFacet = z.object({
+  service: z.string(),
+  operation: z.string(),
+  status: SpanStatus,
+  revision: z.number().int().nonnegative(),
+  onErrorPath: z.boolean(),
+  errorKind: z.string().nullable(),
+});
+export type SpanFacet = z.infer<typeof SpanFacet>;
+
+/** How a single span differs between snapshot A and snapshot B. */
+export const SpanDelta = z.object({
+  traceId: z.string(),
+  spanId: z.string(),
+  service: z.string(),
+  operation: z.string(),
+  /** added: only in B; removed: only in A; changed: present in both but differs. */
+  presence: z.enum(['added', 'removed', 'changed']),
+  statusChanged: z.boolean(),
+  revisionChanged: z.boolean(),
+  /** True when the span's membership on the error/critical path flipped. */
+  pathChanged: z.boolean(),
+  before: SpanFacet.nullable(),
+  after: SpanFacet.nullable(),
+});
+export type SpanDelta = z.infer<typeof SpanDelta>;
+
+/** A deterministic comparison between two sealed snapshots (A -> B). */
+export const SnapshotComparison = z.object({
+  contractVersion: z.literal(CONTRACT_VERSION),
+  from: IncidentSnapshot,
+  to: IncidentSnapshot,
+  added: z.array(SpanDelta),
+  removed: z.array(SpanDelta),
+  changed: z.array(SpanDelta),
+  summary: z.object({
+    added: z.number().int().nonnegative(),
+    removed: z.number().int().nonnegative(),
+    statusChanged: z.number().int().nonnegative(),
+    pathChanged: z.number().int().nonnegative(),
+    revisionChanged: z.number().int().nonnegative(),
+  }),
+});
+export type SnapshotComparison = z.infer<typeof SnapshotComparison>;

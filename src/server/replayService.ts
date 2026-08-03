@@ -32,6 +32,10 @@ export class ReplayService {
     return this.engine;
   }
 
+  getLedger(): LedgerStore {
+    return this.ledger;
+  }
+
   get maxIngestSequence(): number {
     return this.records.length === 0
       ? 0

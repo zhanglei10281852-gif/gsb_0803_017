@@ -4,14 +4,22 @@ import { extname, join, resolve } from "path";
 import { AddressInfo } from "net";
 import { WebSocketServer, WebSocket } from "ws";
 import {
+  AddNoteRequest,
+  AdvanceCursorRequest,
+  AcquireLeaseRequest,
   CONTRACT_VERSION,
+  CreateSessionRequest,
   HealthResponse,
   IngestResponse,
+  InvestigationSession,
   LiveLedgerEvent,
   ReplayCursor,
+  SealSnapshotInSessionRequest,
+  SessionEvent,
 } from "../shared/contracts";
 import { parseNdjson } from "../shared/validation";
 import { ReplayService } from "./replayService";
+import { InvestigationService } from "./investigationService";
 
 const MIME_TYPES: Record<string, string> = {
   ".html": "text/html; charset=utf-8",
@@ -92,11 +100,80 @@ function validateCreateSnapshotRequest(body: unknown): string | null {
   return null;
 }
 
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0;
+}
+
+function parseJsonObject(body: string): unknown | { error: string } {
+  try {
+    return JSON.parse(body || "{}");
+  } catch {
+    return { error: "invalid JSON body" };
+  }
+}
+
+function validateCreateSession(body: unknown): string | null {
+  if (typeof body !== "object" || body === null) return "body must be object";
+  const c = body as CreateSessionRequest;
+  if (!isNonEmptyString(c.anchorSnapshotId)) return "anchorSnapshotId required";
+  if (!isNonEmptyString(c.participantId)) return "participantId required";
+  if (!isNonEmptyString(c.participantName)) return "participantName required";
+  return null;
+}
+
+function validateAcquire(body: unknown): string | null {
+  if (typeof body !== "object" || body === null) return "body must be object";
+  const c = body as AcquireLeaseRequest;
+  if (!isNonEmptyString(c.participantId)) return "participantId required";
+  if (!isNonEmptyString(c.participantName)) return "participantName required";
+  if (typeof c.fencingToken !== "number" || !Number.isInteger(c.fencingToken))
+    return "fencingToken must be integer";
+  return null;
+}
+
+function validateAdvance(body: unknown): string | null {
+  if (typeof body !== "object" || body === null) return "body must be object";
+  const c = body as AdvanceCursorRequest;
+  if (!isNonEmptyString(c.participantId)) return "participantId required";
+  if (typeof c.fencingToken !== "number" || !Number.isInteger(c.fencingToken))
+    return "fencingToken must be integer";
+  if (!isCursor(c.cursor)) return "cursor invalid";
+  if (typeof c.label !== "string") return "label required";
+  return null;
+}
+
+function validateSeal(body: unknown): string | null {
+  if (typeof body !== "object" || body === null) return "body must be object";
+  const c = body as SealSnapshotInSessionRequest;
+  if (!isNonEmptyString(c.participantId)) return "participantId required";
+  if (typeof c.fencingToken !== "number" || !Number.isInteger(c.fencingToken))
+    return "fencingToken must be integer";
+  if (!isCursor(c.cursor)) return "cursor invalid";
+  if (typeof c.label !== "string") return "label required";
+  if (c.notes !== undefined && typeof c.notes !== "string")
+    return "notes must be string";
+  return null;
+}
+
+function validateNote(body: unknown): string | null {
+  if (typeof body !== "object" || body === null) return "body must be object";
+  const c = body as AddNoteRequest;
+  if (!isNonEmptyString(c.sessionId)) return "sessionId required";
+  if (!isNonEmptyString(c.participantId)) return "participantId required";
+  if (!isNonEmptyString(c.participantName)) return "participantName required";
+  if (!isNonEmptyString(c.text)) return "text required";
+  if (!isNonEmptyString(c.clientNoteId)) return "clientNoteId required";
+  return null;
+}
+
 export function createAppServer(options: ServerOptions) {
   const { service, port, host = "127.0.0.1" } = options;
   const staticDir = options.staticDir ?? resolve(__dirname, "../client");
+  const investigation = new InvestigationService(service.getLedger(), service);
 
   const wss = new WebSocketServer({ noServer: true });
+  const sessionRooms = new Map<string, Set<WebSocket>>();
+
   const broadcast = (event: LiveLedgerEvent) => {
     const payload = JSON.stringify(event);
     for (const client of wss.clients) {
@@ -104,6 +181,36 @@ export function createAppServer(options: ServerOptions) {
         client.send(payload);
       }
     }
+  };
+
+  const broadcastSession = (sessionId: string, event: SessionEvent) => {
+    const room = sessionRooms.get(sessionId);
+    if (!room) return;
+    const payload = JSON.stringify(event);
+    for (const client of room) {
+      if (client.readyState === WebSocket.OPEN) client.send(payload);
+    }
+  };
+
+  const emitSessionState = (sessionId: string) => {
+    const session = investigation.getSession(sessionId);
+    if (!session) return;
+    broadcastSession(sessionId, {
+      type: "session-state",
+      session,
+      yourRole: session.lease ? "follower" : "observer",
+      yourState: "following",
+    });
+  };
+
+  const joinSessionRoom = (sessionId: string, ws: WebSocket) => {
+    let room = sessionRooms.get(sessionId);
+    if (!room) {
+      room = new Set();
+      sessionRooms.set(sessionId, room);
+    }
+    room.add(ws);
+    (ws as WebSocket & { __sessionId?: string }).__sessionId = sessionId;
   };
 
   const server = createServer(async (req, res) => {
@@ -295,6 +402,181 @@ export function createAppServer(options: ServerOptions) {
         return;
       }
 
+      if (req.method === "POST" && url.pathname === "/api/sessions") {
+        const parsed = parseJsonObject(await readBody(req));
+        if ("error" in (parsed as object)) {
+          sendJson(res, 400, { error: (parsed as { error: string }).error });
+          return;
+        }
+        const err = validateCreateSession(parsed);
+        if (err) {
+          sendJson(res, 400, { error: err });
+          return;
+        }
+        const body = parsed as CreateSessionRequest;
+        const session = investigation.createSession({
+          anchorSnapshotId: body.anchorSnapshotId,
+          participantId: body.participantId,
+          participantName: body.participantName,
+        });
+        broadcastSession(session.id, {
+          type: "session-state",
+          session,
+          yourRole: "leader",
+          yourState: "following",
+        });
+        sendJson(res, 201, session);
+        return;
+      }
+
+      if (req.method === "GET" && url.pathname.startsWith("/api/sessions/")) {
+        const id = decodeURIComponent(
+          url.pathname.slice("/api/sessions/".length),
+        );
+        const session = investigation.getSession(id);
+        if (!session) {
+          sendJson(res, 404, { error: "session not found" });
+          return;
+        }
+        sendJson(res, 200, session);
+        return;
+      }
+
+      if (
+        req.method === "POST" &&
+        /^\/api\/sessions\/[^/]+\/lease$/.test(url.pathname)
+      ) {
+        const id = decodeURIComponent(url.pathname.split("/")[3]!);
+        const parsed = parseJsonObject(await readBody(req));
+        if ("error" in (parsed as object)) {
+          sendJson(res, 400, { error: (parsed as { error: string }).error });
+          return;
+        }
+        const err = validateAcquire(parsed);
+        if (err) {
+          sendJson(res, 400, { error: err });
+          return;
+        }
+        const body = parsed as AcquireLeaseRequest;
+        const result = investigation.acquireLease(
+          id,
+          body.participantId,
+          body.participantName,
+          body.fencingToken,
+        );
+        if (result.ok && result.lease) {
+          emitSessionState(id);
+        }
+        sendJson(res, result.ok ? 200 : 409, result);
+        return;
+      }
+
+      if (
+        req.method === "POST" &&
+        /^\/api\/sessions\/[^/]+\/cursor$/.test(url.pathname)
+      ) {
+        const id = decodeURIComponent(url.pathname.split("/")[3]!);
+        const parsed = parseJsonObject(await readBody(req));
+        if ("error" in (parsed as object)) {
+          sendJson(res, 400, { error: (parsed as { error: string }).error });
+          return;
+        }
+        const err = validateAdvance(parsed);
+        if (err) {
+          sendJson(res, 400, { error: err });
+          return;
+        }
+        const body = parsed as AdvanceCursorRequest;
+        try {
+          const session = investigation.advanceSharedCursor(
+            id,
+            body.participantId,
+            body.fencingToken,
+            body.cursor,
+            body.label,
+            body.snapshotId ?? null,
+          );
+          if (session.sharedCursor) {
+            broadcastSession(id, {
+              type: "cursor-advanced",
+              sharedCursor: session.sharedCursor,
+            });
+          }
+          sendJson(res, 200, session);
+        } catch (e) {
+          sendJson(res, 409, { error: (e as Error).message });
+        }
+        return;
+      }
+
+      if (
+        req.method === "POST" &&
+        /^\/api\/sessions\/[^/]+\/seal$/.test(url.pathname)
+      ) {
+        const id = decodeURIComponent(url.pathname.split("/")[3]!);
+        const parsed = parseJsonObject(await readBody(req));
+        if ("error" in (parsed as object)) {
+          sendJson(res, 400, { error: (parsed as { error: string }).error });
+          return;
+        }
+        const err = validateSeal(parsed);
+        if (err) {
+          sendJson(res, 400, { error: err });
+          return;
+        }
+        const body = parsed as SealSnapshotInSessionRequest;
+        try {
+          const result = investigation.sealSnapshot(
+            id,
+            body.participantId,
+            body.fencingToken,
+            body.cursor,
+            body.label,
+            body.notes ?? "",
+          );
+          broadcastSession(id, {
+            type: "snapshot-sealed",
+            snapshotId: result.snapshot.id,
+            snapshot: result.snapshot,
+          });
+          broadcastSession(id, {
+            type: "cursor-advanced",
+            sharedCursor: result.session.sharedCursor!,
+          });
+          sendJson(res, 201, result.session);
+        } catch (e) {
+          sendJson(res, 409, { error: (e as Error).message });
+        }
+        return;
+      }
+
+      if (req.method === "POST" && url.pathname === "/api/notes") {
+        const parsed = parseJsonObject(await readBody(req));
+        if ("error" in (parsed as object)) {
+          sendJson(res, 400, { error: (parsed as { error: string }).error });
+          return;
+        }
+        const err = validateNote(parsed);
+        if (err) {
+          sendJson(res, 400, { error: err });
+          return;
+        }
+        const body = parsed as AddNoteRequest;
+        const result = investigation.addNote(body);
+        if (!result.deduped) {
+          broadcastSession(body.sessionId, {
+            type: "note-added",
+            note: result.note,
+          });
+        }
+        sendJson(res, 200, {
+          session: result.session,
+          note: result.note,
+          deduped: result.deduped,
+        });
+        return;
+      }
+
       if (req.method === "GET") {
         let requestPath = url.pathname === "/" ? "/index.html" : url.pathname;
         if (requestPath.includes("..")) {
@@ -332,12 +614,35 @@ export function createAppServer(options: ServerOptions) {
 
   server.on("upgrade", (req, socket, head) => {
     const url = new URL(req.url ?? "/", `http://${host}:${port}`);
-    if (url.pathname !== "/replay") {
+    if (url.pathname !== "/replay" && !url.pathname.startsWith("/replay/")) {
       socket.destroy();
       return;
     }
     wss.handleUpgrade(req, socket, head, (ws) => {
       wss.emit("connection", ws, req);
+      const parts = url.pathname.split("/");
+      const sessionId = parts[2];
+      if (sessionId) {
+        joinSessionRoom(decodeURIComponent(sessionId), ws);
+        const session = investigation.getSession(decodeURIComponent(sessionId));
+        if (session) {
+          ws.send(
+            JSON.stringify({
+              type: "session-state",
+              session,
+              yourRole: "follower",
+              yourState: "following",
+            } satisfies SessionEvent),
+          );
+        }
+      }
+      ws.on("close", () => {
+        const tagged = ws as WebSocket & { __sessionId?: string };
+        if (tagged.__sessionId) {
+          const room = sessionRooms.get(tagged.__sessionId);
+          room?.delete(ws);
+        }
+      });
     });
   });
 

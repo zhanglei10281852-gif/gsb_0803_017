@@ -376,6 +376,105 @@ button.danger { background: var(--error); color: #1a0609; border-color: var(--er
 }
 .snap-history-item.active { border-color: var(--accent); }
 
+.panel-title.with-tabs.three .tab-btn {
+  font-size: 11px;
+  padding: 5px 4px;
+}
+
+.collab-panel {
+  padding: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  font-size: 12px;
+}
+.collab-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 8px;
+}
+.anchor-hash {
+  font-family: ui-monospace, monospace;
+  color: var(--accent);
+  font-size: 11px;
+}
+.collab-identity input,
+.identity-row input,
+.seal-row input,
+.notes-block textarea {
+  width: 100%;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  color: var(--text);
+  padding: 5px 8px;
+  font: inherit;
+  font-size: 12px;
+}
+.identity-row {
+  display: flex;
+  gap: 6px;
+  margin-top: 4px;
+}
+.identity-row input { flex: 1; }
+.lease-box {
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.lease-actions {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.shared-cursor {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+.leader-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.seal-row {
+  display: flex;
+  gap: 6px;
+}
+.seal-row input { flex: 1; }
+.notes-block {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.note-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  max-height: 180px;
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.note-item {
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent-2);
+  border-radius: 5px;
+  padding: 5px 8px;
+}
+.notes-block button { width: 100%; }
+
 @media (max-width: 900px) {
   .app {
     grid-template-columns: 1fr;

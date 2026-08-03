@@ -155,3 +155,120 @@ test("seals A/B snapshots, shows diff, persists notes and sealed digests on relo
     })
     .toBe("确认是 inventory 修订导致错误传播");
 });
+
+test("cross-shift session: lease fencing, shared cursor, merged notes, takeover", async ({
+  page,
+}) => {
+  await page.goto("/");
+  await page.getByTestId("toggle-live").click();
+  await page.getByTestId("tab-snapshots").click();
+
+  const timeline = page.getByTestId("timeline");
+  const max = Number((await timeline.getAttribute("max")) ?? "10");
+  await timeline.evaluate((el: HTMLInputElement, value: number) => {
+    el.value = String(value);
+    el.dispatchEvent(new Event("input", { bubbles: true }));
+  }, 5);
+  await page.getByTestId("capture-a").click();
+  await timeline.evaluate((el: HTMLInputElement, value: number) => {
+    el.value = String(value);
+    el.dispatchEvent(new Event("input", { bubbles: true }));
+  }, max);
+  await page.getByTestId("capture-b").click();
+  await expect(page.getByTestId("snapshot-detail")).toBeVisible();
+
+  await page.getByTestId("tab-collab").click();
+  const nameInput = page.getByTestId("participant-name");
+  await nameInput.waitFor({ state: "visible", timeout: 10000 });
+  await nameInput.fill("Alice 值班");
+  await nameInput.blur();
+  const startBtn = page.getByText("发起会话");
+  if (await startBtn.isVisible()) {
+    await startBtn.click();
+  }
+
+  await expect(page.getByTestId("collab-state")).toContainText("跟随负责人");
+  await expect(page.getByTestId("lease-box")).toContainText("Alice 值班");
+
+  const sessionRes = await page.request.get("/api/snapshots");
+  const allSnapshots = (await sessionRes.json()) as {
+    snapshots: { id: string }[];
+  };
+  const anchorId = allSnapshots.snapshots[0]!.id;
+
+  const session = await page.request.get(`/api/sessions/${anchorId}`);
+  const sessionJson = (await session.json()) as {
+    lease: { token: number; leaderId: string };
+  };
+  const aliceToken = sessionJson.lease.token;
+  const aliceId = sessionJson.lease.leaderId;
+
+  const bobLease = await page.request.post(`/api/sessions/${anchorId}/lease`, {
+    data: {
+      participantId: "bob-id",
+      participantName: "Bob 接班",
+      fencingToken: 0,
+    },
+  });
+  expect(bobLease.status()).toBe(409);
+
+  const staleWrite = await page.request.post(
+    `/api/sessions/${anchorId}/cursor`,
+    {
+      data: {
+        participantId: aliceId,
+        fencingToken: aliceToken,
+        cursor: { ingestSequence: 3, eventTime: 3000000000 },
+        label: "stale",
+      },
+    },
+  );
+  expect(staleWrite.ok()).toBeTruthy();
+
+  const n1 = await page.request.post("/api/notes", {
+    data: {
+      sessionId: anchorId,
+      participantId: "bob-id",
+      participantName: "Bob 接班",
+      text: "Bob 确认故障已扩散到 notifier",
+      clientNoteId: "note-bob-1",
+    },
+  });
+  expect(n1.ok()).toBeTruthy();
+  const n2 = await page.request.post("/api/notes", {
+    data: {
+      sessionId: anchorId,
+      participantId: aliceId,
+      participantName: "Alice 值班",
+      text: "Alice 初判 inventory 死锁",
+      clientNoteId: "note-alice-1",
+    },
+  });
+  expect(n2.ok()).toBeTruthy();
+  const n1Retry = await page.request.post("/api/notes", {
+    data: {
+      sessionId: anchorId,
+      participantId: "bob-id",
+      participantName: "Bob 接班",
+      text: "Bob 确认故障已扩散到 notifier",
+      clientNoteId: "note-bob-1",
+    },
+  });
+  const n1RetryJson = (await n1Retry.json()) as { deduped: boolean };
+  expect(n1RetryJson.deduped).toBe(true);
+
+  const afterNotes = await page.request.get(`/api/sessions/${anchorId}`);
+  const afterJson = (await afterNotes.json()) as {
+    notes: { seq: number; text: string }[];
+  };
+  expect(afterJson.notes).toHaveLength(2);
+  expect(afterJson.notes.map((n) => n.seq)).toEqual([1, 2]);
+
+  await expect(page.getByTestId("note-list")).toContainText(
+    "Alice 初判 inventory 死锁",
+  );
+
+  await page.getByTestId("note-input").fill("UI 追加的备注");
+  await page.getByTestId("add-note").click();
+  await expect(page.getByTestId("note-list")).toContainText("UI 追加的备注");
+});

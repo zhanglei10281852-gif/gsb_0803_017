@@ -9,6 +9,8 @@ import { IncidentSnapshot, ReplayCursor, SpanDiffEntry } from '../../shared/cont
 interface SnapshotPanelProps {
   currentCursor: ReplayCursor | null;
   live: boolean;
+  onSnapshotCreated?: (snapshot: IncidentSnapshot) => void;
+  activeAnchorId?: string | null;
 }
 
 function shortHash(value: string): string {
@@ -27,7 +29,7 @@ function diffRowClass(entry: SpanDiffEntry): string {
   return 'diff-revision';
 }
 
-export function SnapshotPanel({ currentCursor, live }: SnapshotPanelProps) {
+export function SnapshotPanel({ currentCursor, live, onSnapshotCreated, activeAnchorId }: SnapshotPanelProps) {
   const [snapshots, setSnapshots] = useState<IncidentSnapshot[]>([]);
   const [selected, setSelected] = useState<IncidentSnapshot | null>(null);
   const [notes, setNotes] = useState('');
@@ -68,6 +70,7 @@ export function SnapshotPanel({ currentCursor, live }: SnapshotPanelProps) {
     setSelected(snapshot);
     setNotes(snapshot.notes);
     refresh();
+    onSnapshotCreated?.(snapshot);
   };
 
   const handleCompareCurrent = async () => {
@@ -87,6 +90,7 @@ export function SnapshotPanel({ currentCursor, live }: SnapshotPanelProps) {
     setSelected(snapshot);
     setNotes(snapshot.notes);
     refresh();
+    onSnapshotCreated?.(snapshot);
   };
 
   const handleSaveNotes = async () => {
@@ -217,6 +221,7 @@ export function SnapshotPanel({ currentCursor, live }: SnapshotPanelProps) {
               onClick={() => {
                 setSelected(item);
                 setNotes(item.notes);
+                onSnapshotCreated?.(item);
               }}
               data-testid={`snap-history-${item.id.slice(0, 8)}`}
             >

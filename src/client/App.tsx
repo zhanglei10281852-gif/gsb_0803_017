@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
+  IncidentSnapshot,
   LiveLedgerEvent,
   ReplayCursor,
   ReplayView,
@@ -10,6 +11,7 @@ import { SpanList } from "./components/SpanList";
 import { SpanDetailPanel } from "./components/SpanDetailPanel";
 import { TopologyScene } from "./components/TopologyScene";
 import { SnapshotPanel } from "./components/SnapshotPanel";
+import { CollaborationPanel } from "./components/CollaborationPanel";
 
 function formatClock(ms: number): string {
   if (ms <= 0) return "—";
@@ -29,7 +31,13 @@ export default function App() {
   const [detailLoading, setDetailLoading] = useState(false);
   const [selectedService, setSelectedService] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [rightTab, setRightTab] = useState<"detail" | "snapshots">("detail");
+  const [rightTab, setRightTab] = useState<"detail" | "snapshots" | "collab">(
+    "detail",
+  );
+  const [anchorSnapshotId, setAnchorSnapshotId] = useState<string | null>(null);
+  const [anchorSnapshot, setAnchorSnapshot] = useState<IncidentSnapshot | null>(
+    null,
+  );
   const liveRef = useRef(live);
   liveRef.current = live;
 
@@ -145,6 +153,41 @@ export default function App() {
     if (span) setSelectedService(span.service);
   };
 
+  const handleFollowSharedCursor = useCallback(
+    (cursor: ReplayCursor) => {
+      setLive(false);
+      setCursorSeq(cursor.ingestSequence);
+      loadView(false, cursor.ingestSequence);
+    },
+    [loadView],
+  );
+
+  const handleSnapshotCreated = useCallback((snapshot: IncidentSnapshot) => {
+    setAnchorSnapshotId(snapshot.id);
+    setAnchorSnapshot(snapshot);
+  }, []);
+
+  useEffect(() => {
+    if (!anchorSnapshotId) {
+      setAnchorSnapshot(null);
+      return;
+    }
+    let cancelled = false;
+    fetch(`./api/snapshots/${encodeURIComponent(anchorSnapshotId)}`, {
+      headers: { Accept: "application/json" },
+    })
+      .then((r) => (r.ok ? r.json() : Promise.reject(new Error("not found"))))
+      .then((s: IncidentSnapshot) => {
+        if (!cancelled) setAnchorSnapshot(s);
+      })
+      .catch(() => {
+        if (!cancelled) setAnchorSnapshot(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [anchorSnapshotId]);
+
   return (
     <div className="app">
       <header className="header">
@@ -223,7 +266,7 @@ export default function App() {
       )}
 
       <aside className="panel right">
-        <div className="panel-title with-tabs">
+        <div className="panel-title with-tabs three">
           <button
             className={`tab-btn ${rightTab === "detail" ? "active" : ""}`}
             onClick={() => setRightTab("detail")}
@@ -236,14 +279,33 @@ export default function App() {
             onClick={() => setRightTab("snapshots")}
             data-testid="tab-snapshots"
           >
-            事故快照对比
+            快照对比
+          </button>
+          <button
+            className={`tab-btn ${rightTab === "collab" ? "active" : ""}`}
+            onClick={() => setRightTab("collab")}
+            data-testid="tab-collab"
+          >
+            跨班协作
           </button>
         </div>
         <div className="panel-body">
           {rightTab === "detail" ? (
             <SpanDetailPanel detail={detail} loading={detailLoading} />
+          ) : rightTab === "snapshots" ? (
+            <SnapshotPanel
+              currentCursor={effectiveCursor}
+              live={live}
+              onSnapshotCreated={handleSnapshotCreated}
+              activeAnchorId={anchorSnapshotId}
+            />
           ) : (
-            <SnapshotPanel currentCursor={effectiveCursor} live={live} />
+            <CollaborationPanel
+              anchorSnapshot={anchorSnapshot}
+              currentCursor={effectiveCursor}
+              live={live}
+              onFollowCursor={handleFollowSharedCursor}
+            />
           )}
         </div>
       </aside>

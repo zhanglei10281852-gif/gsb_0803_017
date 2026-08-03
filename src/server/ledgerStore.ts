@@ -2,8 +2,12 @@ import Database from "better-sqlite3";
 import { existsSync, mkdirSync } from "fs";
 import { dirname, resolve } from "path";
 import {
+  FencingToken,
   IncidentSnapshot,
+  InvestigationSession,
   LedgerRecord,
+  SessionNoteEntry,
+  SharedCursor,
   SpanAttributes,
   SpanEvent,
 } from "../shared/contracts";
@@ -71,6 +75,15 @@ export class LedgerStore {
   private readonly listSnapshotsStmt: Database.Statement;
   private readonly getSnapshotStmt: Database.Statement;
   private readonly updateNotesStmt: Database.Statement;
+  private readonly insertSessionStmt: Database.Statement;
+  private readonly getSessionStmt: Database.Statement;
+  private readonly updateLeaseStmt: Database.Statement;
+  private readonly updateSharedCursorStmt: Database.Statement;
+  private readonly updateSnapshotIdsStmt: Database.Statement;
+  private readonly insertNoteStmt: Database.Statement;
+  private readonly maxNoteSeqStmt: Database.Statement;
+  private readonly listNotesStmt: Database.Statement;
+  private readonly noteExistsStmt: Database.Statement;
 
   constructor(dbPath: string) {
     const absolutePath = resolve(dbPath);
@@ -117,6 +130,35 @@ export class LedgerStore {
         sealed INTEGER NOT NULL DEFAULT 1
       );
       CREATE INDEX IF NOT EXISTS idx_snapshots_created ON incident_snapshots(created_at);
+
+      CREATE TABLE IF NOT EXISTS investigation_sessions (
+        id TEXT PRIMARY KEY,
+        anchor_snapshot_id TEXT NOT NULL,
+        anchor_digest_a TEXT NOT NULL,
+        anchor_digest_b TEXT NOT NULL,
+        lease_leader_id TEXT,
+        lease_leader_name TEXT,
+        lease_fencing_token INTEGER,
+        lease_acquired_at INTEGER,
+        lease_expires_at INTEGER,
+        shared_cursor TEXT,
+        snapshot_ids TEXT NOT NULL DEFAULT '[]',
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS session_notes (
+        id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        participant_id TEXT NOT NULL,
+        participant_name TEXT NOT NULL,
+        text TEXT NOT NULL,
+        seq INTEGER NOT NULL,
+        client_note_id TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        UNIQUE(session_id, client_note_id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_session_notes_session ON session_notes(session_id, seq);
     `);
 
     this.insertStmt = this.db.prepare(`
@@ -158,6 +200,46 @@ export class LedgerStore {
     );
     this.updateNotesStmt = this.db.prepare(
       "UPDATE incident_snapshots SET notes = @notes WHERE id = @id",
+    );
+
+    this.insertSessionStmt = this.db.prepare(`
+      INSERT INTO investigation_sessions
+        (id, anchor_snapshot_id, anchor_digest_a, anchor_digest_b,
+         lease_leader_id, lease_leader_name, lease_fencing_token, lease_acquired_at, lease_expires_at,
+         shared_cursor, snapshot_ids, created_at, updated_at)
+      VALUES (@id, @anchor_snapshot_id, @anchor_digest_a, @anchor_digest_b,
+              @lease_leader_id, @lease_leader_name, @lease_fencing_token, @lease_acquired_at, @lease_expires_at,
+              @shared_cursor, @snapshot_ids, @created_at, @updated_at)
+    `);
+    this.getSessionStmt = this.db.prepare(
+      "SELECT * FROM investigation_sessions WHERE id = ?",
+    );
+    this.updateLeaseStmt = this.db.prepare(`
+      UPDATE investigation_sessions
+      SET lease_leader_id = @leader_id, lease_leader_name = @leader_name,
+          lease_fencing_token = @fencing_token, lease_acquired_at = @acquired_at,
+          lease_expires_at = @expires_at, updated_at = @updated_at
+      WHERE id = @id
+    `);
+    this.updateSharedCursorStmt = this.db.prepare(
+      "UPDATE investigation_sessions SET shared_cursor = @shared_cursor, updated_at = @updated_at WHERE id = @id",
+    );
+    this.updateSnapshotIdsStmt = this.db.prepare(
+      "UPDATE investigation_sessions SET snapshot_ids = @snapshot_ids, updated_at = @updated_at WHERE id = @id",
+    );
+    this.insertNoteStmt = this.db.prepare(`
+      INSERT OR IGNORE INTO session_notes
+        (id, session_id, participant_id, participant_name, text, seq, client_note_id, created_at)
+      VALUES (@id, @session_id, @participant_id, @participant_name, @text, @seq, @client_note_id, @created_at)
+    `);
+    this.maxNoteSeqStmt = this.db.prepare(
+      "SELECT COALESCE(MAX(seq), 0) AS max_seq FROM session_notes WHERE session_id = ?",
+    );
+    this.listNotesStmt = this.db.prepare(
+      "SELECT * FROM session_notes WHERE session_id = ? ORDER BY seq ASC, id ASC",
+    );
+    this.noteExistsStmt = this.db.prepare(
+      "SELECT * FROM session_notes WHERE session_id = ? AND client_note_id = ?",
     );
   }
 
@@ -254,7 +336,7 @@ export class LedgerStore {
       digest_a: JSON.stringify(snapshot.digestA),
       digest_b: JSON.stringify(snapshot.digestB),
       diff: JSON.stringify(snapshot.diff),
-      notes: snapshot.notes
+      notes: snapshot.notes,
     });
   }
 
@@ -271,6 +353,110 @@ export class LedgerStore {
   updateSnapshotNotes(id: string, notes: string): IncidentSnapshot | null {
     this.updateNotesStmt.run({ id, notes });
     return this.getSnapshot(id);
+  }
+
+  saveSession(session: InvestigationSession): void {
+    this.insertSessionStmt.run({
+      id: session.id,
+      anchor_snapshot_id: session.anchorSnapshotId,
+      anchor_digest_a: session.anchorDigestA,
+      anchor_digest_b: session.anchorDigestB,
+      lease_leader_id: session.lease?.leaderId ?? null,
+      lease_leader_name: session.lease?.leaderName ?? null,
+      lease_fencing_token: session.lease?.token ?? null,
+      lease_acquired_at: session.lease?.acquiredAt ?? null,
+      lease_expires_at: session.lease?.expiresAt ?? null,
+      shared_cursor: session.sharedCursor
+        ? JSON.stringify(session.sharedCursor)
+        : null,
+      snapshot_ids: JSON.stringify(session.snapshotIds),
+      created_at: session.createdAt,
+      updated_at: session.updatedAt,
+    });
+  }
+
+  getSessionRow(id: string): SessionRow | null {
+    const row = this.getSessionStmt.get(id) as SessionRow | undefined;
+    return row ?? null;
+  }
+
+  updateLease(id: string, lease: FencingToken | null, now: number): void {
+    this.updateLeaseStmt.run({
+      id,
+      leader_id: lease?.leaderId ?? null,
+      leader_name: lease?.leaderName ?? null,
+      fencing_token: lease?.token ?? null,
+      acquired_at: lease?.acquiredAt ?? null,
+      expires_at: lease?.expiresAt ?? null,
+      updated_at: now,
+    });
+  }
+
+  updateSharedCursor(
+    id: string,
+    sharedCursor: SharedCursor | null,
+    now: number,
+  ): void {
+    this.updateSharedCursorStmt.run({
+      id,
+      shared_cursor: sharedCursor ? JSON.stringify(sharedCursor) : null,
+      updated_at: now,
+    });
+  }
+
+  updateSessionSnapshotIds(
+    id: string,
+    snapshotIds: readonly string[],
+    now: number,
+  ): void {
+    this.updateSnapshotIdsStmt.run({
+      id,
+      snapshot_ids: JSON.stringify(snapshotIds),
+      updated_at: now,
+    });
+  }
+
+  addSessionNote(
+    sessionId: string,
+    noteId: string,
+    entry: Omit<SessionNoteEntry, "id"> & { clientNoteId: string },
+  ): boolean {
+    const info = this.insertNoteStmt.run({
+      id: noteId,
+      session_id: sessionId,
+      participant_id: entry.participantId,
+      participant_name: entry.participantName,
+      text: entry.text,
+      seq: entry.seq,
+      client_note_id: entry.clientNoteId,
+      created_at: entry.createdAt,
+    });
+    return info.changes > 0;
+  }
+
+  noteExists(sessionId: string, clientNoteId: string): boolean {
+    const row = this.noteExistsStmt.get(sessionId, clientNoteId) as
+      | NoteRow
+      | undefined;
+    return Boolean(row);
+  }
+
+  maxNoteSeq(sessionId: string): number {
+    const row = this.maxNoteSeqStmt.get(sessionId) as { max_seq: number };
+    return row.max_seq;
+  }
+
+  listSessionNotes(sessionId: string): SessionNoteEntry[] {
+    const rows = this.listNotesStmt.all(sessionId) as NoteRow[];
+    return rows.map((row) => ({
+      id: row.id,
+      participantId: row.participant_id,
+      participantName: row.participant_name,
+      text: row.text,
+      seq: row.seq,
+      createdAt: row.created_at,
+      clientNoteId: row.client_note_id,
+    }));
   }
 }
 
@@ -295,12 +481,69 @@ function rowToSnapshot(row: SnapshotRow): IncidentSnapshot {
     createdAt: row.created_at,
     labelA: row.label_a,
     labelB: row.label_b,
-    cursorA: JSON.parse(row.cursor_a) as IncidentSnapshot['cursorA'],
-    cursorB: JSON.parse(row.cursor_b) as IncidentSnapshot['cursorB'],
-    digestA: JSON.parse(row.digest_a) as IncidentSnapshot['digestA'],
-    digestB: JSON.parse(row.digest_b) as IncidentSnapshot['digestB'],
-    diff: JSON.parse(row.diff) as IncidentSnapshot['diff'],
+    cursorA: JSON.parse(row.cursor_a) as IncidentSnapshot["cursorA"],
+    cursorB: JSON.parse(row.cursor_b) as IncidentSnapshot["cursorB"],
+    digestA: JSON.parse(row.digest_a) as IncidentSnapshot["digestA"],
+    digestB: JSON.parse(row.digest_b) as IncidentSnapshot["digestB"],
+    diff: JSON.parse(row.diff) as IncidentSnapshot["diff"],
     notes: row.notes,
-    sealed: true
+    sealed: true,
+  };
+}
+
+interface SessionRow {
+  id: string;
+  anchor_snapshot_id: string;
+  anchor_digest_a: string;
+  anchor_digest_b: string;
+  lease_leader_id: string | null;
+  lease_leader_name: string | null;
+  lease_fencing_token: number | null;
+  lease_acquired_at: number | null;
+  lease_expires_at: number | null;
+  shared_cursor: string | null;
+  snapshot_ids: string;
+  created_at: number;
+  updated_at: number;
+}
+
+interface NoteRow {
+  id: string;
+  participant_id: string;
+  participant_name: string;
+  text: string;
+  seq: number;
+  client_note_id: string;
+  created_at: number;
+}
+
+export function rowToSession(
+  row: SessionRow,
+  notes: SessionNoteEntry[],
+): InvestigationSession {
+  const lease: FencingToken | null =
+    row.lease_leader_id && row.lease_fencing_token != null
+      ? {
+          token: row.lease_fencing_token,
+          leaderId: row.lease_leader_id,
+          leaderName: row.lease_leader_name ?? row.lease_leader_id,
+          acquiredAt: row.lease_acquired_at ?? 0,
+          expiresAt: row.lease_expires_at ?? 0,
+        }
+      : null;
+  return {
+    contractVersion: 1,
+    id: row.id,
+    anchorSnapshotId: row.anchor_snapshot_id,
+    anchorDigestA: row.anchor_digest_a,
+    anchorDigestB: row.anchor_digest_b,
+    lease,
+    sharedCursor: row.shared_cursor
+      ? (JSON.parse(row.shared_cursor) as SharedCursor)
+      : null,
+    notes,
+    snapshotIds: JSON.parse(row.snapshot_ids) as string[],
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
   };
 }

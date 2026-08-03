@@ -1,8 +1,13 @@
 export const CONTRACT_VERSION = 1;
 
-export type SpanKind = 'client' | 'server' | 'producer' | 'consumer' | 'internal';
+export type SpanKind =
+  | "client"
+  | "server"
+  | "producer"
+  | "consumer"
+  | "internal";
 
-export type SpanStatus = 'ok' | 'error' | 'unset';
+export type SpanStatus = "ok" | "error" | "unset";
 
 export interface SpanAttributes {
   readonly [key: string]: string | number | boolean;
@@ -53,7 +58,11 @@ export interface TopologyNode {
   readonly service: string;
   readonly spanCount: number;
   readonly errorCount: number;
-  readonly position: { readonly x: number; readonly y: number; readonly z: number };
+  readonly position: {
+    readonly x: number;
+    readonly y: number;
+    readonly z: number;
+  };
 }
 
 export interface TopologyEdge {
@@ -121,7 +130,7 @@ export interface ErrorPropagationPath {
 }
 
 export interface EffectiveReason {
-  readonly kind: 'newest-revision' | 'first-seen' | 'overwritten-later';
+  readonly kind: "newest-revision" | "first-seen" | "overwritten-later";
   readonly comparedVersions: number;
   readonly winningIngestSequence: number;
   readonly detail: string;
@@ -166,7 +175,7 @@ export interface HealthResponse {
 }
 
 export interface LiveLedgerEvent {
-  readonly type: 'ledger-appended';
+  readonly type: "ledger-appended";
   readonly maxIngestSequence: number;
   readonly maxEventTime: number;
   readonly totalRecords: number;
@@ -188,7 +197,11 @@ export interface SnapshotDigest {
   readonly errorPathCount: number;
 }
 
-export type SpanDiffKind = 'added' | 'removed' | 'status-changed' | 'revision-changed';
+export type SpanDiffKind =
+  | "added"
+  | "removed"
+  | "status-changed"
+  | "revision-changed";
 
 export interface SpanDiffEntry {
   readonly traceId: string;
@@ -206,10 +219,10 @@ export interface SpanDiffEntry {
 }
 
 export type CriticalPathChangeKind =
-  | 'path-extended'
-  | 'path-shortened'
-  | 'origin-changed'
-  | 'service-set-changed';
+  | "path-extended"
+  | "path-shortened"
+  | "origin-changed"
+  | "service-set-changed";
 
 export interface CriticalPathDiff {
   readonly traceId: string;
@@ -263,3 +276,107 @@ export interface CreateSnapshotRequest {
 export interface UpdateSnapshotNotesRequest {
   readonly notes: string;
 }
+
+export type SessionRole = "leader" | "follower" | "observer";
+export type SessionClientState = "following" | "independent" | "lease-lost";
+
+export interface SessionNoteEntry {
+  readonly id: string;
+  readonly participantId: string;
+  readonly participantName: string;
+  readonly text: string;
+  readonly seq: number;
+  readonly createdAt: number;
+}
+
+export interface SharedCursor {
+  readonly cursor: ReplayCursor;
+  readonly label: string;
+  readonly updatedAt: number;
+  readonly updatedBy: string;
+  readonly snapshotId: string | null;
+}
+
+export interface FencingToken {
+  readonly token: number;
+  readonly leaderId: string;
+  readonly leaderName: string;
+  readonly acquiredAt: number;
+  readonly expiresAt: number;
+}
+
+export interface InvestigationSession {
+  readonly contractVersion: typeof CONTRACT_VERSION;
+  readonly id: string;
+  readonly anchorSnapshotId: string;
+  readonly anchorDigestA: string;
+  readonly anchorDigestB: string;
+  readonly lease: FencingToken | null;
+  readonly sharedCursor: SharedCursor | null;
+  readonly notes: readonly SessionNoteEntry[];
+  readonly snapshotIds: readonly string[];
+  readonly createdAt: number;
+  readonly updatedAt: number;
+}
+
+export interface CreateSessionRequest {
+  readonly anchorSnapshotId: string;
+  readonly participantId: string;
+  readonly participantName: string;
+}
+
+export interface AcquireLeaseRequest {
+  readonly participantId: string;
+  readonly participantName: string;
+  readonly fencingToken: number;
+}
+
+export interface AcquireLeaseResponse {
+  readonly ok: boolean;
+  readonly lease: FencingToken | null;
+  readonly reason:
+    | "acquired"
+    | "renewed"
+    | "rejected-active-lease"
+    | "stale-token";
+}
+
+export interface AdvanceCursorRequest {
+  readonly participantId: string;
+  readonly fencingToken: number;
+  readonly cursor: ReplayCursor;
+  readonly label: string;
+  readonly snapshotId?: string | null;
+}
+
+export interface SealSnapshotInSessionRequest {
+  readonly participantId: string;
+  readonly fencingToken: number;
+  readonly cursor: ReplayCursor;
+  readonly label: string;
+  readonly notes?: string;
+}
+
+export interface AddNoteRequest {
+  readonly sessionId: string;
+  readonly participantId: string;
+  readonly participantName: string;
+  readonly text: string;
+  readonly clientNoteId: string;
+}
+
+export type SessionEvent =
+  | {
+      readonly type: "session-state";
+      readonly session: InvestigationSession;
+      readonly yourRole: SessionRole;
+      readonly yourState: SessionClientState;
+    }
+  | { readonly type: "lease-changed"; readonly lease: FencingToken | null }
+  | { readonly type: "cursor-advanced"; readonly sharedCursor: SharedCursor }
+  | { readonly type: "note-added"; readonly note: SessionNoteEntry }
+  | {
+      readonly type: "snapshot-sealed";
+      readonly snapshotId: string;
+      readonly snapshot: IncidentSnapshot;
+    };

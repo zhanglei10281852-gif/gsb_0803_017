@@ -97,6 +97,72 @@ export interface ReplayView {
   traces: TraceSummary[];
 }
 
+export type SnapshotSlot = 'A' | 'B';
+
+export interface IncidentSnapshot {
+  id: string;
+  slot: SnapshotSlot;
+  label: string;
+  cursor: ReplayCursor;
+  ledgerHead: ReplayCursor;
+  totalLedgerRecords: number;
+  visibleRecordCount: number;
+  digest: string;
+  createdAt: number;
+  notes: string;
+}
+
+export type SpanChangeField =
+  | 'status'
+  | 'revision'
+  | 'service'
+  | 'operation'
+  | 'parentSpanId'
+  | 'errorMessage';
+
+export interface SpanChange {
+  traceId: string;
+  spanId: string;
+  fields: SpanChangeField[];
+  before: SpanView;
+  after: SpanView;
+}
+
+export interface CriticalPathChange {
+  traceId: string;
+  rootErrorSpanId: string;
+  beforePath: string[];
+  afterPath: string[];
+}
+
+export interface SnapshotDiff {
+  a: IncidentSnapshot;
+  b: IncidentSnapshot;
+  added: SpanView[];
+  removed: SpanView[];
+  changed: SpanChange[];
+  criticalPathChanges: CriticalPathChange[];
+  sameDigest: boolean;
+  summary: {
+    addedCount: number;
+    removedCount: number;
+    changedCount: number;
+    criticalPathChangeCount: number;
+  };
+}
+
+export interface CreateSnapshotRequest {
+  slot: SnapshotSlot;
+  label?: string;
+  cursor: ReplayCursor;
+  notes?: string;
+}
+
+export interface UpdateSnapshotNotesRequest {
+  notes: string;
+}
+
+
 export interface HeadResponse {
   head: ReplayCursor;
   totalLedgerRecords: number;
@@ -210,4 +276,24 @@ export function parseReplayCursor(value: unknown): ReplayCursor {
 
 export function emptyHead(): ReplayCursor {
   return { eventTime: 0, ingestSequence: 0 };
+}
+
+export function parseSnapshotSlot(value: unknown): SnapshotSlot {
+  if (value === 'A' || value === 'B') return value;
+  throw new Error('slot must be "A" or "B"');
+}
+
+export function parseCreateSnapshotRequest(value: unknown): CreateSnapshotRequest {
+  if (!isObject(value)) throw new Error('request must be an object');
+  const slot = parseSnapshotSlot(value.slot);
+  const cursor = parseReplayCursor(value.cursor);
+  const label = value.label === undefined ? undefined : value.label;
+  if (label !== undefined && !isString(label)) {
+    throw new Error('label must be a string');
+  }
+  const notes = value.notes === undefined ? '' : value.notes;
+  if (!isString(notes)) {
+    throw new Error('notes must be a string');
+  }
+  return { slot, label, cursor, notes };
 }

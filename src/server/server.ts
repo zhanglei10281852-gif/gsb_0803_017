@@ -7,7 +7,11 @@ import { WebSocketServer, type WebSocket } from 'ws';
 import type { ReplayEngine } from './replay.js';
 import { parseNdjsonBody } from './ingest.js';
 import type { WsServerMessage } from '../shared/contracts.js';
-import { parseReplayCursor } from '../shared/contracts.js';
+import {
+  parseReplayCursor,
+  parseCreateSnapshotRequest,
+  parseSnapshotSlot,
+} from '../shared/contracts.js';
 import type { SampleRunner } from './sampleRunner.js';
 
 const MIME_TYPES: Record<string, string> = {
@@ -146,6 +150,103 @@ export function createAppServer(ctx: AppContext) {
         sampleRunner.stop();
         sendJson(res, 200, { running: false });
         broadcast({ type: 'sample', running: false });
+        return;
+      }
+
+      if (pathname === '/api/snapshots' && method === 'POST') {
+        const text = await readBody(req);
+        let body: unknown;
+        try {
+          body = JSON.parse(text);
+        } catch (e) {
+          sendJson(res, 400, { error: `invalid JSON: ${(e as Error).message}` });
+          return;
+        }
+        let req2;
+        try {
+          req2 = parseCreateSnapshotRequest(body);
+        } catch (e) {
+          sendJson(res, 400, { error: (e as Error).message });
+          return;
+        }
+        const snapshot = engine.createSnapshot(
+          req2.slot,
+          req2.label ?? (req2.slot === 'A' ? 'Moment A' : 'Moment B'),
+          req2.cursor,
+          req2.notes ?? '',
+        );
+        sendJson(res, 201, snapshot);
+        return;
+      }
+
+      if (pathname === '/api/snapshots' && method === 'GET') {
+        sendJson(res, 200, { snapshots: engine.listSnapshots() });
+        return;
+      }
+
+      if (pathname === '/api/snapshots/compare' && method === 'GET') {
+        const aId = reqUrl.searchParams.get('a');
+        const bId = reqUrl.searchParams.get('b');
+        if (aId && bId) {
+          const diff = engine.compareSnapshots(aId, bId);
+          sendJson(res, 200, diff);
+        } else {
+          const diff = engine.compareLatestAB();
+          if (!diff) {
+            sendJson(res, 404, { error: 'need both A and B snapshots' });
+            return;
+          }
+          sendJson(res, 200, diff);
+        }
+        return;
+      }
+
+      const snapshotMatch = pathname.match(/^\/api\/snapshots\/([^/]+)$/);
+      if (snapshotMatch && method === 'GET') {
+        const snap = engine.getSnapshot(decodeURIComponent(snapshotMatch[1]!));
+        if (!snap) {
+          sendJson(res, 404, { error: 'snapshot not found' });
+          return;
+        }
+        sendJson(res, 200, snap);
+        return;
+      }
+
+      const notesMatch = pathname.match(/^\/api\/snapshots\/([^/]+)\/notes$/);
+      if (notesMatch && method === 'PUT') {
+        const text = await readBody(req);
+        let body: unknown;
+        try {
+          body = JSON.parse(text);
+        } catch (e) {
+          sendJson(res, 400, { error: `invalid JSON: ${(e as Error).message}` });
+          return;
+        }
+        const notes = typeof body === 'object' && body !== null && 'notes' in body
+          ? (body as { notes: unknown }).notes
+          : undefined;
+        if (typeof notes !== 'string') {
+          sendJson(res, 400, { error: 'notes must be a string' });
+          return;
+        }
+        const updated = engine.updateSnapshotNotes(decodeURIComponent(notesMatch[1]!), notes);
+        if (!updated) {
+          sendJson(res, 404, { error: 'snapshot not found' });
+          return;
+        }
+        sendJson(res, 200, updated);
+        return;
+      }
+
+      const slotMatch = pathname.match(/^\/api\/snapshots\/slot\/([AB])$/);
+      if (slotMatch && method === 'GET') {
+        const slot = parseSnapshotSlot(slotMatch[1]);
+        const snap = engine.getLatestSnapshot(slot);
+        if (!snap) {
+          sendJson(res, 404, { error: 'no snapshot for slot' });
+          return;
+        }
+        sendJson(res, 200, snap);
         return;
       }
 

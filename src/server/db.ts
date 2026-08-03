@@ -117,6 +117,10 @@ export class LedgerStore {
     return rows.map((r) => this.rowToRecord(r));
   }
 
+  getDatabase(): Database.Database {
+    return this.db;
+  }
+
   close(): void {
     this.db.close();
   }

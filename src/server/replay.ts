@@ -1,28 +1,38 @@
 import { EventEmitter } from 'node:events';
+import { createHash } from 'node:crypto';
 import type {
   LedgerRecord,
   RawSpanEvent,
   ReplayCursor,
   ReplayView,
   SpanVersionExplanation,
+  IncidentSnapshot,
+  SnapshotSlot,
+  SnapshotDiff,
 } from '../shared/contracts.js';
 import {
   buildReplayView,
   computeHead,
   explainSpanVersions,
+  buildDigestInput,
+  buildSnapshotDiff,
+  isRecordVisible,
 } from '../shared/projection.js';
 import type { LedgerStore } from './db.js';
+import { SnapshotStore } from './snapshotStore.js';
 
 export type EngineListener = (record: LedgerRecord, head: ReplayCursor) => void;
 
 export class ReplayEngine {
   private readonly store: LedgerStore;
+  private readonly snapshots: SnapshotStore;
   private records: LedgerRecord[];
   private readonly emitter: EventEmitter;
 
   constructor(store: LedgerStore) {
     this.store = store;
     this.records = store.getAllRecords();
+    this.snapshots = new SnapshotStore(store.getDatabase());
     this.emitter = new EventEmitter();
     this.emitter.setMaxListeners(0);
   }
@@ -83,6 +93,67 @@ export class ReplayEngine {
     return () => {
       this.emitter.off('record', listener);
     };
+  }
+
+  computeDigest(cursor: ReplayCursor): { digest: string; visibleRecordCount: number } {
+    const visible = this.records.filter((r) => isRecordVisible(r, cursor));
+    const input = buildDigestInput(visible);
+    const digest = createHash('sha256').update(input).digest('hex');
+    return { digest, visibleRecordCount: visible.length };
+  }
+
+  createSnapshot(
+    slot: SnapshotSlot,
+    label: string,
+    cursor: ReplayCursor,
+    notes: string,
+  ): IncidentSnapshot {
+    const ledgerHead = this.getHead();
+    const { digest, visibleRecordCount } = this.computeDigest(cursor);
+    return this.snapshots.create({
+      slot,
+      label,
+      cursor,
+      ledgerHead,
+      totalLedgerRecords: this.records.length,
+      visibleRecordCount,
+      digest,
+      notes,
+      createdAt: Date.now(),
+    });
+  }
+
+  listSnapshots(): IncidentSnapshot[] {
+    return this.snapshots.list();
+  }
+
+  getSnapshot(id: string): IncidentSnapshot | null {
+    return this.snapshots.getById(id);
+  }
+
+  getLatestSnapshot(slot: SnapshotSlot): IncidentSnapshot | null {
+    return this.snapshots.getLatestBySlot(slot);
+  }
+
+  updateSnapshotNotes(id: string, notes: string): IncidentSnapshot | null {
+    return this.snapshots.updateNotes(id, notes);
+  }
+
+  compareSnapshots(aId: string, bId: string): SnapshotDiff {
+    const a = this.snapshots.getById(aId);
+    const b = this.snapshots.getById(bId);
+    if (!a) throw new Error(`snapshot A not found: ${aId}`);
+    if (!b) throw new Error(`snapshot B not found: ${bId}`);
+    const viewA = this.getView(a.cursor);
+    const viewB = this.getView(b.cursor);
+    return buildSnapshotDiff(a, b, viewA, viewB);
+  }
+
+  compareLatestAB(): SnapshotDiff | null {
+    const a = this.snapshots.getLatestBySlot('A');
+    const b = this.snapshots.getLatestBySlot('B');
+    if (!a || !b) return null;
+    return this.compareSnapshots(a.id, b.id);
   }
 
   close(): void {

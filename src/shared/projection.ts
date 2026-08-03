@@ -7,6 +7,11 @@ import {
   type TopologyEdge,
   type TraceSummary,
   type ReplayView,
+  type IncidentSnapshot,
+  type SnapshotDiff,
+  type SpanChange,
+  type SpanChangeField,
+  type CriticalPathChange,
   emptyHead,
 } from './contracts.js';
 
@@ -293,4 +298,153 @@ export function findErrorPropagationPath(
     current = byKey.get(spanKey(current.traceId, current.parentSpanId));
   }
   return path;
+}
+
+function stableStringify(value: unknown): string {
+  if (value === null) return 'null';
+  if (typeof value !== 'object') return JSON.stringify(value);
+  if (Array.isArray(value)) {
+    return '[' + value.map((v) => stableStringify(v)).join(',') + ']';
+  }
+  const obj = value as Record<string, unknown>;
+  const keys = Object.keys(obj).sort();
+  return '{' + keys.map((k) => JSON.stringify(k) + ':' + stableStringify(obj[k])).join(',') + '}';
+}
+
+export function buildDigestInput(visibleRecords: LedgerRecord[]): string {
+  const sorted = [...visibleRecords].sort(
+    (a, b) => a.ingestSequence - b.ingestSequence,
+  );
+  return sorted
+    .map(
+      (r) =>
+        `${r.ingestSequence}|${r.ingestTime}|${stableStringify(r.event)}`,
+    )
+    .join('\n');
+}
+
+function diffSpanFields(a: SpanView, b: SpanView): SpanChangeField[] {
+  const fields: SpanChangeField[] = [];
+  if (a.status !== b.status) fields.push('status');
+  if (a.revision !== b.revision) fields.push('revision');
+  if (a.service !== b.service) fields.push('service');
+  if (a.operation !== b.operation) fields.push('operation');
+  if (a.parentSpanId !== b.parentSpanId) fields.push('parentSpanId');
+  if (a.errorMessage !== b.errorMessage) fields.push('errorMessage');
+  return fields;
+}
+
+function indexSpans(spans: SpanView[]): Map<string, SpanView> {
+  const map = new Map<string, SpanView>();
+  for (const s of spans) {
+    map.set(spanKey(s.traceId, s.spanId), s);
+  }
+  return map;
+}
+
+function computeErrorPaths(spans: SpanView[]): Map<string, Map<string, string[]>> {
+  const byTrace = new Map<string, SpanView[]>();
+  for (const s of spans) {
+    let arr = byTrace.get(s.traceId);
+    if (arr === undefined) {
+      arr = [];
+      byTrace.set(s.traceId, arr);
+    }
+    arr.push(s);
+  }
+  const result = new Map<string, Map<string, string[]>>();
+  for (const [traceId, traceSpans] of byTrace) {
+    const pathMap = new Map<string, string[]>();
+    const errorSpans = traceSpans.filter((s) => s.status === 'error');
+    for (const err of errorSpans) {
+      const path = findErrorPropagationPath(traceSpans, traceId, err.spanId);
+      pathMap.set(err.spanId, path.map((s) => s.spanId));
+    }
+    result.set(traceId, pathMap);
+  }
+  return result;
+}
+
+export function diffReplayViews(
+  viewA: ReplayView,
+  viewB: ReplayView,
+): {
+  added: SpanView[];
+  removed: SpanView[];
+  changed: SpanChange[];
+  criticalPathChanges: CriticalPathChange[];
+} {
+  const mapA = indexSpans(viewA.spans);
+  const mapB = indexSpans(viewB.spans);
+
+  const added: SpanView[] = [];
+  const removed: SpanView[] = [];
+  const changed: SpanChange[] = [];
+
+  for (const [key, b] of mapB) {
+    const a = mapA.get(key);
+    if (a === undefined) {
+      added.push(b);
+    } else {
+      const fields = diffSpanFields(a, b);
+      if (fields.length > 0) {
+        changed.push({ traceId: b.traceId, spanId: b.spanId, fields, before: a, after: b });
+      }
+    }
+  }
+  for (const [key, a] of mapA) {
+    if (!mapB.has(key)) removed.push(a);
+  }
+
+  added.sort((x, y) => x.eventTime - y.eventTime);
+  removed.sort((x, y) => x.eventTime - y.eventTime);
+
+  const pathsA = computeErrorPaths(viewA.spans);
+  const pathsB = computeErrorPaths(viewB.spans);
+  const criticalPathChanges: CriticalPathChange[] = [];
+  const allTraceIds = new Set<string>([...pathsA.keys(), ...pathsB.keys()]);
+  for (const traceId of allTraceIds) {
+    const errA = pathsA.get(traceId) ?? new Map<string, string[]>();
+    const errB = pathsB.get(traceId) ?? new Map<string, string[]>();
+    const allErrIds = new Set<string>([...errA.keys(), ...errB.keys()]);
+    for (const errId of allErrIds) {
+      const pA = errA.get(errId);
+      const pB = errB.get(errId);
+      if (pA === undefined || pB === undefined) continue;
+      if (pA.length !== pB.length || pA.some((id, i) => id !== pB[i])) {
+        criticalPathChanges.push({
+          traceId,
+          rootErrorSpanId: errId,
+          beforePath: pA,
+          afterPath: pB,
+        });
+      }
+    }
+  }
+
+  return { added, removed, changed, criticalPathChanges };
+}
+
+export function buildSnapshotDiff(
+  snapshotA: IncidentSnapshot,
+  snapshotB: IncidentSnapshot,
+  viewA: ReplayView,
+  viewB: ReplayView,
+): SnapshotDiff {
+  const { added, removed, changed, criticalPathChanges } = diffReplayViews(viewA, viewB);
+  return {
+    a: snapshotA,
+    b: snapshotB,
+    added,
+    removed,
+    changed,
+    criticalPathChanges,
+    sameDigest: snapshotA.digest === snapshotB.digest,
+    summary: {
+      addedCount: added.length,
+      removedCount: removed.length,
+      changedCount: changed.length,
+      criticalPathChangeCount: criticalPathChanges.length,
+    },
+  };
 }

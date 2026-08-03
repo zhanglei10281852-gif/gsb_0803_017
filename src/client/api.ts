@@ -5,6 +5,9 @@ import type {
   SpanVersionExplanation,
   WsServerMessage,
   IngestResult,
+  IncidentSnapshot,
+  SnapshotDiff,
+  SnapshotSlot,
 } from '@shared/contracts.js';
 
 export interface SpanVersionsResponse {
@@ -76,4 +79,45 @@ export function connectLive(onMessage: (msg: WsServerMessage) => void): WebSocke
     }
   };
   return ws;
+}
+
+export function createSnapshot(
+  slot: SnapshotSlot,
+  cursor: ReplayCursor,
+  label?: string,
+  notes?: string,
+): Promise<IncidentSnapshot> {
+  return jsonRequest<IncidentSnapshot>('/api/snapshots', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ slot, cursor, label, notes: notes ?? '' }),
+  });
+}
+
+export function listSnapshots(): Promise<{ snapshots: IncidentSnapshot[] }> {
+  return jsonRequest('/api/snapshots');
+}
+
+export function getSnapshot(id: string): Promise<IncidentSnapshot> {
+  return jsonRequest(`/api/snapshots/${encodeURIComponent(id)}`);
+}
+
+export function getLatestSnapshot(slot: SnapshotSlot): Promise<IncidentSnapshot> {
+  return jsonRequest(`/api/snapshots/slot/${slot}`);
+}
+
+export function updateSnapshotNotes(id: string, notes: string): Promise<IncidentSnapshot> {
+  return jsonRequest(`/api/snapshots/${encodeURIComponent(id)}/notes`, {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ notes }),
+  });
+}
+
+export function compareSnapshots(aId?: string, bId?: string): Promise<SnapshotDiff> {
+  const params = new URLSearchParams();
+  if (aId) params.set('a', aId);
+  if (bId) params.set('b', bId);
+  const qs = params.toString();
+  return jsonRequest<SnapshotDiff>(`/api/snapshots/compare${qs ? `?${qs}` : ''}`);
 }

@@ -18,6 +18,7 @@ import { Topology3D, type Selection } from './components/Topology3D.js';
 import { SpanList } from './components/SpanList.js';
 import { SpanDetail } from './components/SpanDetail.js';
 import { Timeline } from './components/Timeline.js';
+import { SnapshotPanel } from './components/SnapshotPanel.js';
 
 const EMPTY_VIEW: ReplayView = {
   cursor: emptyHead(),
@@ -39,6 +40,7 @@ export function App() {
   const [sampleRunning, setSampleRunning] = useState(false);
   const [wsConnected, setWsConnected] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [showSnapshots, setShowSnapshots] = useState(false);
 
   const cursorRef = useRef(cursor);
   const isLiveRef = useRef(isLive);
@@ -191,8 +193,13 @@ export function App() {
     setSelected(sel);
   }, []);
 
+  const handleJumpToCursor = useCallback((c: ReplayCursor) => {
+    setIsLive(false);
+    setCursor(c);
+  }, []);
+
   return (
-    <div className="app">
+    <div className={`app ${showSnapshots ? 'with-snapshots' : ''}`}>
       <header className="topbar">
         <h1>Trace Replay Platform</h1>
         <span className={`badge ${wsConnected ? 'live' : 'paused'}`}>
@@ -207,6 +214,9 @@ export function App() {
           </span>
         )}
         <div className="spacer" />
+        <button className={showSnapshots ? 'active' : ''} onClick={() => setShowSnapshots((v) => !v)}>
+          📸 Compare
+        </button>
         <button className={isLive ? 'active' : ''} onClick={goLive}>
           ▶ Live
         </button>
@@ -234,6 +244,12 @@ export function App() {
       </div>
 
       <SpanDetail selected={selected} currentSpan={currentSpan} versions={versions} />
+
+      {showSnapshots && (
+        <div className="snapshot-drawer">
+          <SnapshotPanel cursor={cursor} onJumpTo={handleJumpToCursor} />
+        </div>
+      )}
 
       <Timeline view={view} cursor={cursor} head={head} isLive={isLive} onCursorChange={handleCursorChange} />
     </div>

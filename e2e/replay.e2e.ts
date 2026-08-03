@@ -219,3 +219,113 @@ test.describe('browser interaction', () => {
     await expect(countBadge).not.toContainText('0 current spans');
   });
 });
+
+test.describe('incident snapshots', () => {
+  test('seals A and B, diffs status change, updates notes without mutating seal', async ({ request }) => {
+    const body = ndjson([
+      event('snap-t1', 'root', { service: 'gateway', eventTime: 1000 }),
+      event('snap-t1', 'pay', { service: 'payments', parentSpanId: 'root', eventTime: 1100, revision: 1, status: 'ok' }),
+    ]);
+    await request.post(`${BASE}/api/ingest`, { data: body });
+
+    const headA = await (await request.get(`${BASE}/api/head`)).json();
+    const totalAtA = headA.totalLedgerRecords;
+    const cursorA = { eventTime: 999999, ingestSequence: headA.head.ingestSequence };
+    const snapA = await request.post(`${BASE}/api/snapshots`, {
+      data: { slot: 'A', label: 'before-correction', cursor: cursorA, notes: 'payments looked OK' },
+    });
+    expect(snapA.ok()).toBeTruthy();
+    const snapAJson = await snapA.json();
+    expect(snapAJson.digest).toMatch(/^[0-9a-f]{64}$/);
+    expect(snapAJson.totalLedgerRecords).toBe(totalAtA);
+
+    const correction = ndjson([
+      event('snap-t1', 'pay', { service: 'payments', parentSpanId: 'root', eventTime: 1100, revision: 2, status: 'error', errorMessage: 'card declined' }),
+    ]);
+    await request.post(`${BASE}/api/ingest`, { data: correction });
+
+    const headB = await (await request.get(`${BASE}/api/head`)).json();
+    expect(headB.totalLedgerRecords).toBe(totalAtA + 1);
+    const cursorB = { eventTime: 999999, ingestSequence: headB.head.ingestSequence };
+    const snapB = await request.post(`${BASE}/api/snapshots`, {
+      data: { slot: 'B', label: 'after-correction', cursor: cursorB, notes: '' },
+    });
+    const snapBJson = await snapB.json();
+    expect(snapBJson.totalLedgerRecords).toBe(totalAtA + 1);
+
+    const diff = await (await request.get(`${BASE}/api/snapshots/compare?a=${snapAJson.id}&b=${snapBJson.id}`)).json();
+    expect(diff.summary.changedCount).toBeGreaterThanOrEqual(1);
+    const payChange = diff.changed.find((c: { spanId: string }) => c.spanId === 'pay');
+    expect(payChange).toBeTruthy();
+    expect(payChange.fields).toContain('status');
+    expect(payChange.before.status).toBe('ok');
+    expect(payChange.after.status).toBe('error');
+    expect(payChange.before.revision).toBe(1);
+    expect(payChange.after.revision).toBe(2);
+    expect(diff.sameDigest).toBe(false);
+
+    const notesRes = await request.put(`${BASE}/api/snapshots/${snapAJson.id}/notes`, {
+      data: { notes: 'updated investigation note' },
+    });
+    const notesJson = await notesRes.json();
+    expect(notesJson.notes).toBe('updated investigation note');
+    expect(notesJson.digest).toBe(snapAJson.digest, 'digest must not change when notes are edited');
+    expect(notesJson.cursor).toEqual(snapAJson.cursor, 'cursor must remain sealed');
+
+    const sealedAgain = await (await request.get(`${BASE}/api/snapshots/${snapAJson.id}`)).json();
+    expect(sealedAgain.totalLedgerRecords).toBe(totalAtA, 'sealed snapshot must reflect state at sealing, not current');
+    expect(sealedAgain.digest).toBe(snapAJson.digest);
+  });
+
+  test('latest-A/latest-B compare endpoint works with slot query', async ({ request }) => {
+    const diff = await request.get(`${BASE}/api/snapshots/compare`);
+    expect(diff.ok()).toBeTruthy();
+    const json = await diff.json();
+    expect(json.a.slot).toBe('A');
+    expect(json.b.slot).toBe('B');
+  });
+});
+
+test.describe('snapshot browser interaction', () => {
+  test.beforeEach(async ({ page }) => {
+    await page.goto('/');
+  });
+
+  test('opens snapshot drawer, seals A and B from sample stream, shows diff', async ({ page }) => {
+    await page.getByRole('button', { name: /Play sample stream/ }).click();
+    await page.locator('.span-item').first().waitFor({ timeout: 15000 });
+    await page.waitForTimeout(1500);
+    await page.getByRole('button', { name: /Pause/ }).click();
+
+    await page.getByRole('button', { name: /Compare/ }).click();
+    await expect(page.locator('.snapshot-panel')).toBeVisible();
+    await page.getByRole('button', { name: 'Seal A here' }).click();
+    await page.waitForTimeout(300);
+
+    await page.getByRole('button', { name: /Stop sample/ }).click().catch(() => undefined);
+    await page.getByRole('button', { name: '▶ Live' }).click();
+    await page.waitForTimeout(800);
+
+    await page.getByRole('button', { name: 'Seal B here' }).click();
+    await page.waitForTimeout(600);
+
+    await expect(page.locator('.snapshot-diff')).toBeVisible();
+    await expect(page.locator('.diff-summary')).toContainText(/added|changed|disappeared/);
+  });
+
+  test('saves investigation notes', async ({ page }) => {
+    await page.getByRole('button', { name: /Compare/ }).click();
+    await page.getByRole('button', { name: 'Seal A here' }).click();
+    await page.waitForTimeout(300);
+
+    const notes = page.getByLabel('notes-A');
+    await notes.fill('Root cause suspected at 09:09 — payments timeout');
+    await page.getByRole('button', { name: 'Save notes' }).first().click();
+    await page.waitForTimeout(300);
+
+    await page.reload();
+    await page.getByRole('button', { name: /Compare/ }).click();
+    await expect(page.getByLabel('notes-A')).toHaveValue('Root cause suspected at 09:09 — payments timeout');
+  });
+});
+

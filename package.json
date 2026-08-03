@@ -1,0 +1,40 @@
+{
+  "name": "trace-incident-replay",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Distributed trace incident replay platform with append-only ledger and deterministic replay cursors",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build:server": "tsc -p tsconfig.server.json",
+    "build:client": "vite build",
+    "build": "npm run build:server && npm run build:client",
+    "prestart": "npm run build",
+    "start": "node dist/server/main.js",
+    "sample": "node dist/scripts/sample-stream.js",
+    "test": "vitest run",
+    "e2e": "npm run build && playwright test",
+    "dev": "node dist/server/main.js"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.3.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "three": "^0.169.0",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.48.0",
+    "@types/better-sqlite3": "^7.6.11",
+    "@types/node": "^20.16.10",
+    "@types/react": "^18.3.11",
+    "@types/react-dom": "^18.3.0",
+    "@types/three": "^0.169.0",
+    "@types/ws": "^8.5.12",
+    "@vitejs/plugin-react": "^4.3.2",
+    "typescript": "^5.6.2",
+    "vite": "^5.4.8",
+    "vitest": "^2.1.2"
+  }
+}

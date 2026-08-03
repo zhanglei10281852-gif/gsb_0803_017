@@ -144,7 +144,8 @@ export interface CausalPathV1 {
 export type WsServerMessageV1 =
   | { contract: "ws/1"; kind: "hello"; head: ReplayCursorV1; totalEntries: number }
   | { contract: "ws/1"; kind: "entry"; entry: LedgerEntryV1 }
-  | { contract: "ws/1"; kind: "live"; head: ReplayCursorV1 };
+  | { contract: "ws/1"; kind: "live"; head: ReplayCursorV1 }
+  | { contract: "ws/1"; kind: "session-state"; state: InvestigationSessionV1 };
 
 export interface HeadResponseV1 {
   contract: "head/1";
@@ -302,3 +303,86 @@ export interface SnapshotDetailV1 {
   snapshot: IncidentSnapshotV1;
   verify: VerifyReportV1;
 }
+
+/* ---------- InvestigationSession：跨班协作调查会话 ---------- */
+
+/** 会话参与者（无账号体系，自报班组名 + 客户端 id）。 */
+export interface SessionParticipantV1 {
+  clientId: string;
+  name: string;
+  joinedAtMs: number;
+  lastSeenMs: number;
+}
+
+/** 租约：fencing token 随每次授租单调递增并持久化。 */
+export interface LeaseV1 {
+  holderId: string;
+  holderName: string;
+  fencingToken: number;
+  acquiredAtMs: number;
+  expiresAtMs: number;
+  ttlMs: number;
+}
+
+/**
+ * 会话备注：确定性归并——全部保留，按 (createdAtMs, clientId, noteId) 全序排列，
+ * 与到达顺序无关；mergeDigest 用于验证各端归并结果一致（非最后写入者获胜）。
+ */
+export interface SessionNoteV1 {
+  noteId: string;
+  clientId: string;
+  author: string;
+  text: string;
+  createdAtMs: number;
+  seq: number;
+}
+
+export interface InvestigationSessionV1 {
+  contract: "investigation-session/1";
+  sessionId: string;
+  /** 交接锚点：已封存快照的标识与摘要。 */
+  anchorSnapshotId: string;
+  anchorDigest: string;
+  label: string | null;
+  createdAtMs: number;
+  createdBy: string;
+  /** 共同游标：仅持有有效租约的一方可推进。 */
+  sharedCursor: ReplayCursorV1;
+  lease: LeaseV1 | null;
+  participants: SessionParticipantV1[];
+  notes: SessionNoteV1[];
+  mergeDigest: string;
+  /** 会话内封存的快照（按封存顺序）。 */
+  snapshotIds: string[];
+  serverTimeMs: number;
+}
+
+export interface SessionListItemV1 {
+  contract: "session-item/1";
+  sessionId: string;
+  anchorSnapshotId: string;
+  anchorDigest: string;
+  label: string | null;
+  createdAtMs: number;
+  createdBy: string;
+  leaseHolderName: string | null;
+  noteCount: number;
+}
+
+export interface SessionListV1 {
+  contract: "session-list/1";
+  items: SessionListItemV1[];
+}
+
+/** 门控失败：no-valid-lease（无人持有有效租约）/ stale-fencing-token（旧令牌晚到）/ lease-held（他人持租）。 */
+export interface GateErrorV1 {
+  contract: "gate-error/1";
+  error: "no-valid-lease" | "stale-fencing-token" | "lease-held";
+  lease: LeaseV1 | null;
+}
+
+export type WsClientMessageV1 = {
+  contract: "ws-client/1";
+  kind: "subscribe-session";
+  sessionId: string | null;
+};

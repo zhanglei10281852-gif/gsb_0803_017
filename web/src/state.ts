@@ -168,6 +168,14 @@ export class ReplayStore {
     this.changed();
   }
 
+  /** 跟随负责人：共同游标由会话负责人推进，本地直接采用（双坐标）。 */
+  applyExternalCursor(cursor: ReplayCursorV1): void {
+    if (this.mode === "live") this.pause();
+    this.pinnedIngest = cursor.ingestSequence;
+    this.cursor = cursor;
+    this.changed();
+  }
+
   select(sel: Selection | null): void {
     this.selection = sel;
     this.changed();

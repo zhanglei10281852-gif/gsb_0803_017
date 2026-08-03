@@ -5,15 +5,24 @@ import express, { type Express, type Request, type Response } from "express";
 import {
   buildView,
   explainSpanVersions,
+  parseCreateSession,
+  parseCursorPush,
+  parseJoinSession,
+  parseLeaseAcquire,
+  parseLeaseToken,
   parseNoteInput,
   parseSealRequest,
+  parseSessionNote,
+  parseSessionSeal,
   parseSpanEventLine,
   CONTRACT_VERSION,
+  type GateErrorV1,
   type IngestBatchResultV1,
   type ReplayCursorV1,
   type SealResponseV1,
   type SpanEventV1,
 } from "@replay/shared";
+import { SessionService, type SessionResult } from "./session.js";
 import { computeSnapshot, verifySnapshot } from "./snapshot.js";
 import type { ReplayStore } from "./store.js";
 
@@ -197,6 +206,133 @@ export function createApp(deps: AppDeps): Express {
       return;
     }
     res.status(201).json(note);
+  });
+
+  /* ---------- InvestigationSession：跨班协作 ---------- */
+
+  const sessions = new SessionService(store, emitter);
+  const respondSession = <T>(res: Response, r: SessionResult<T>, okStatus = 200): void => {
+    if (!r.ok) {
+      const body: GateErrorV1 = {
+        contract: "gate-error/1",
+        error: r.error as GateErrorV1["error"],
+        lease: r.lease,
+      };
+      res.status(r.status).json(body);
+      return;
+    }
+    res.status(okStatus).json(r.value);
+  };
+
+  app.post("/api/sessions", express.json({ limit: "64kb" }), (req, res) => {
+    const parsed = parseCreateSession(req.body as unknown);
+    if (!parsed.ok) {
+      res.status(400).json({ error: parsed.error });
+      return;
+    }
+    respondSession(res, sessions.createSession(parsed.value), 201);
+  });
+
+  app.get("/api/sessions", (_req, res) => {
+    res.json({ contract: "session-list/1", items: sessions.listSessions() });
+  });
+
+  app.get("/api/sessions/:id", (req, res) => {
+    const state = sessions.getSession(req.params.id);
+    if (!state) {
+      res.status(404).json({ error: "会话不存在" });
+      return;
+    }
+    res.json(state);
+  });
+
+  app.post("/api/sessions/:id/join", express.json({ limit: "64kb" }), (req, res) => {
+    const parsed = parseJoinSession(req.body as unknown);
+    if (!parsed.ok) {
+      res.status(400).json({ error: parsed.error });
+      return;
+    }
+    respondSession(res, sessions.join(req.params.id, parsed.value.clientId, parsed.value.name));
+  });
+
+  app.post("/api/sessions/:id/lease", express.json({ limit: "64kb" }), (req, res) => {
+    const parsed = parseLeaseAcquire(req.body as unknown);
+    if (!parsed.ok) {
+      res.status(400).json({ error: parsed.error });
+      return;
+    }
+    respondSession(
+      res,
+      sessions.acquireLease(req.params.id, parsed.value.clientId, parsed.value.name, parsed.value.ttlMs),
+    );
+  });
+
+  app.post("/api/sessions/:id/lease/renew", express.json({ limit: "64kb" }), (req, res) => {
+    const parsed = parseLeaseToken(req.body as unknown);
+    if (!parsed.ok) {
+      res.status(400).json({ error: parsed.error });
+      return;
+    }
+    respondSession(
+      res,
+      sessions.renewLease(req.params.id, parsed.value.clientId, parsed.value.fencingToken, parsed.value.ttlMs),
+    );
+  });
+
+  app.post("/api/sessions/:id/lease/release", express.json({ limit: "64kb" }), (req, res) => {
+    const parsed = parseLeaseToken(req.body as unknown);
+    if (!parsed.ok) {
+      res.status(400).json({ error: parsed.error });
+      return;
+    }
+    respondSession(res, sessions.releaseLease(req.params.id, parsed.value.clientId, parsed.value.fencingToken));
+  });
+
+  app.post("/api/sessions/:id/cursor", express.json({ limit: "64kb" }), (req, res) => {
+    const parsed = parseCursorPush(req.body as unknown);
+    if (!parsed.ok) {
+      res.status(400).json({ error: parsed.error });
+      return;
+    }
+    respondSession(
+      res,
+      sessions.pushCursor(req.params.id, parsed.value.clientId, parsed.value.fencingToken, parsed.value.cursor),
+    );
+  });
+
+  app.post("/api/sessions/:id/seal", express.json({ limit: "64kb" }), (req, res) => {
+    const parsed = parseSessionSeal(req.body as unknown);
+    if (!parsed.ok) {
+      res.status(400).json({ error: parsed.error });
+      return;
+    }
+    const r = sessions.sealSnapshot(
+      req.params.id,
+      parsed.value.clientId,
+      parsed.value.fencingToken,
+      parsed.value.cursorA,
+      parsed.value.cursorB,
+      parsed.value.label,
+    );
+    if (!r.ok) {
+      respondSession(res, r);
+      return;
+    }
+    res.status(r.value.existing ? 200 : 201).json({
+      contract: "seal-response/1",
+      snapshot: r.value.snapshot,
+      existing: r.value.existing,
+    });
+  });
+
+  // 备注全员可写（无需租约），服务端按确定性规则归并
+  app.post("/api/sessions/:id/notes", express.json({ limit: "64kb" }), (req, res) => {
+    const parsed = parseSessionNote(req.body as unknown);
+    if (!parsed.ok) {
+      res.status(400).json({ error: parsed.error });
+      return;
+    }
+    respondSession(res, sessions.addNote(req.params.id, parsed.value), 201);
   });
 
   if (fs.existsSync(webDist)) {

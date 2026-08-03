@@ -7,12 +7,15 @@ import {
   type IncidentSnapshotV1,
   type LedgerEntryV1,
   type ReplayCursorV1,
+  type SessionNoteV1,
+  type SessionParticipantV1,
   type SnapshotDiffV1,
   type SnapshotListItemV1,
   type SnapshotNoteV1,
   type SpanEventV1,
   type IngestReceiptV1,
 } from "@replay/shared";
+import type { SessionNoteInput } from "@replay/shared";
 
 export interface HeadInfo {
   cursor: ReplayCursorV1;
@@ -103,6 +106,49 @@ export class ReplayStore {
         FOREIGN KEY (snapshot_id) REFERENCES snapshots(id)
       );
       CREATE INDEX IF NOT EXISTS idx_notes_snapshot ON snapshot_notes(snapshot_id);
+      CREATE TABLE IF NOT EXISTS sessions (
+        session_id TEXT PRIMARY KEY,
+        anchor_snapshot_id TEXT NOT NULL,
+        anchor_digest TEXT NOT NULL,
+        label TEXT,
+        created_at_ms INTEGER NOT NULL,
+        created_by TEXT NOT NULL,
+        shared_cursor TEXT NOT NULL,
+        fencing_seq INTEGER NOT NULL DEFAULT 0
+      );
+      CREATE TABLE IF NOT EXISTS session_leases (
+        session_id TEXT PRIMARY KEY,
+        holder_id TEXT NOT NULL,
+        holder_name TEXT NOT NULL,
+        fencing_token INTEGER NOT NULL,
+        acquired_at_ms INTEGER NOT NULL,
+        expires_at_ms INTEGER NOT NULL,
+        ttl_ms INTEGER NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS session_participants (
+        session_id TEXT NOT NULL,
+        client_id TEXT NOT NULL,
+        name TEXT NOT NULL,
+        joined_at_ms INTEGER NOT NULL,
+        last_seen_ms INTEGER NOT NULL,
+        PRIMARY KEY (session_id, client_id)
+      );
+      CREATE TABLE IF NOT EXISTS session_notes (
+        session_id TEXT NOT NULL,
+        note_id TEXT NOT NULL,
+        client_id TEXT NOT NULL,
+        author TEXT NOT NULL,
+        text TEXT NOT NULL,
+        created_at_ms REAL NOT NULL,
+        seq INTEGER PRIMARY KEY AUTOINCREMENT,
+        UNIQUE (session_id, note_id)
+      );
+      CREATE TABLE IF NOT EXISTS session_snapshots (
+        session_id TEXT NOT NULL,
+        snapshot_id TEXT NOT NULL,
+        sealed_at_ms INTEGER NOT NULL,
+        PRIMARY KEY (session_id, snapshot_id)
+      );
       INSERT OR IGNORE INTO meta(key, value) VALUES ('schema_version', '1');
     `);
   }
@@ -408,5 +454,248 @@ export class ReplayStore {
       .prepare("INSERT INTO snapshot_notes (note_id, snapshot_id, created_at_ms, author, text) VALUES (?, ?, ?, ?, ?)")
       .run(note.noteId, snapshotId, note.createdAtMs, note.author, note.text);
     return note;
+  }
+
+  /* ---------- InvestigationSession：会话 / 租约 / 参与者 / 备注 / 会话快照 ---------- */
+
+  createSessionRow(row: {
+    sessionId: string;
+    anchorSnapshotId: string;
+    anchorDigest: string;
+    label: string | null;
+    createdAtMs: number;
+    createdBy: string;
+    sharedCursor: ReplayCursorV1;
+  }): void {
+    this.db
+      .prepare(
+        `INSERT INTO sessions (session_id, anchor_snapshot_id, anchor_digest, label, created_at_ms, created_by, shared_cursor, fencing_seq)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 0)`,
+      )
+      .run(
+        row.sessionId,
+        row.anchorSnapshotId,
+        row.anchorDigest,
+        row.label,
+        row.createdAtMs,
+        row.createdBy,
+        JSON.stringify(row.sharedCursor),
+      );
+  }
+
+  getSessionRow(sessionId: string):
+    | {
+        session_id: string;
+        anchor_snapshot_id: string;
+        anchor_digest: string;
+        label: string | null;
+        created_at_ms: number;
+        created_by: string;
+        shared_cursor: string;
+        fencing_seq: number;
+      }
+    | undefined {
+    return this.db
+      .prepare(
+        "SELECT session_id, anchor_snapshot_id, anchor_digest, label, created_at_ms, created_by, shared_cursor, fencing_seq FROM sessions WHERE session_id = ?",
+      )
+      .get(sessionId) as
+      | {
+          session_id: string;
+          anchor_snapshot_id: string;
+          anchor_digest: string;
+          label: string | null;
+          created_at_ms: number;
+          created_by: string;
+          shared_cursor: string;
+          fencing_seq: number;
+        }
+      | undefined;
+  }
+
+  listSessionRows(): Array<{
+    session_id: string;
+    anchor_snapshot_id: string;
+    anchor_digest: string;
+    label: string | null;
+    created_at_ms: number;
+    created_by: string;
+  }> {
+    return this.db
+      .prepare(
+        "SELECT session_id, anchor_snapshot_id, anchor_digest, label, created_at_ms, created_by FROM sessions ORDER BY created_at_ms DESC",
+      )
+      .all() as Array<{
+      session_id: string;
+      anchor_snapshot_id: string;
+      anchor_digest: string;
+      label: string | null;
+      created_at_ms: number;
+      created_by: string;
+    }>;
+  }
+
+  updateSharedCursor(sessionId: string, cursor: ReplayCursorV1): void {
+    this.db
+      .prepare("UPDATE sessions SET shared_cursor = ? WHERE session_id = ?")
+      .run(JSON.stringify(cursor), sessionId);
+  }
+
+  /** fencing token 持久化单调递增：每次授租取下一个值。 */
+  nextFencingToken(sessionId: string): number {
+    this.db
+      .prepare("UPDATE sessions SET fencing_seq = fencing_seq + 1 WHERE session_id = ?")
+      .run(sessionId);
+    const row = this.db
+      .prepare("SELECT fencing_seq AS f FROM sessions WHERE session_id = ?")
+      .get(sessionId) as { f: number };
+    return row.f;
+  }
+
+  getLease(sessionId: string):
+    | {
+        holder_id: string;
+        holder_name: string;
+        fencing_token: number;
+        acquired_at_ms: number;
+        expires_at_ms: number;
+        ttl_ms: number;
+      }
+    | undefined {
+    return this.db
+      .prepare(
+        "SELECT holder_id, holder_name, fencing_token, acquired_at_ms, expires_at_ms, ttl_ms FROM session_leases WHERE session_id = ?",
+      )
+      .get(sessionId) as
+      | {
+          holder_id: string;
+          holder_name: string;
+          fencing_token: number;
+          acquired_at_ms: number;
+          expires_at_ms: number;
+          ttl_ms: number;
+        }
+      | undefined;
+  }
+
+  setLease(
+    sessionId: string,
+    lease: {
+      holderId: string;
+      holderName: string;
+      fencingToken: number;
+      acquiredAtMs: number;
+      expiresAtMs: number;
+      ttlMs: number;
+    },
+  ): void {
+    this.db
+      .prepare(
+        `INSERT INTO session_leases (session_id, holder_id, holder_name, fencing_token, acquired_at_ms, expires_at_ms, ttl_ms)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(session_id) DO UPDATE SET
+           holder_id = excluded.holder_id,
+           holder_name = excluded.holder_name,
+           fencing_token = excluded.fencing_token,
+           acquired_at_ms = excluded.acquired_at_ms,
+           expires_at_ms = excluded.expires_at_ms,
+           ttl_ms = excluded.ttl_ms`,
+      )
+      .run(
+        sessionId,
+        lease.holderId,
+        lease.holderName,
+        lease.fencingToken,
+        lease.acquiredAtMs,
+        lease.expiresAtMs,
+        lease.ttlMs,
+      );
+  }
+
+  clearLease(sessionId: string): void {
+    this.db.prepare("DELETE FROM session_leases WHERE session_id = ?").run(sessionId);
+  }
+
+  upsertParticipant(sessionId: string, clientId: string, name: string, nowMs: number): void {
+    this.db
+      .prepare(
+        `INSERT INTO session_participants (session_id, client_id, name, joined_at_ms, last_seen_ms)
+         VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT(session_id, client_id) DO UPDATE SET name = excluded.name, last_seen_ms = excluded.last_seen_ms`,
+      )
+      .run(sessionId, clientId, name, nowMs, nowMs);
+  }
+
+  listParticipants(sessionId: string): SessionParticipantV1[] {
+    const rows = this.db
+      .prepare(
+        "SELECT client_id, name, joined_at_ms, last_seen_ms FROM session_participants WHERE session_id = ? ORDER BY joined_at_ms ASC, client_id ASC",
+      )
+      .all(sessionId) as Array<{ client_id: string; name: string; joined_at_ms: number; last_seen_ms: number }>;
+    return rows.map((r) => ({
+      clientId: r.client_id,
+      name: r.name,
+      joinedAtMs: r.joined_at_ms,
+      lastSeenMs: r.last_seen_ms,
+    }));
+  }
+
+  /** 备注幂等写入（客户端重试不产生重复），归并排序在查询侧完成。 */
+  insertSessionNote(sessionId: string, note: SessionNoteInput): void {
+    this.db
+      .prepare(
+        `INSERT OR IGNORE INTO session_notes (session_id, note_id, client_id, author, text, created_at_ms)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+      )
+      .run(sessionId, note.noteId, note.clientId, note.author, note.text, note.createdAtMs);
+  }
+
+  /** 确定性归并：按 (createdAtMs, clientId, noteId) 全序，与到达顺序无关。 */
+  listSessionNotes(sessionId: string): SessionNoteV1[] {
+    const rows = this.db
+      .prepare(
+        `SELECT note_id, client_id, author, text, created_at_ms, seq FROM session_notes
+         WHERE session_id = ? ORDER BY created_at_ms ASC, client_id ASC, note_id ASC`,
+      )
+      .all(sessionId) as Array<{
+      note_id: string;
+      client_id: string;
+      author: string;
+      text: string;
+      created_at_ms: number;
+      seq: number;
+    }>;
+    return rows.map((r) => ({
+      noteId: r.note_id,
+      clientId: r.client_id,
+      author: r.author,
+      text: r.text,
+      createdAtMs: r.created_at_ms,
+      seq: r.seq,
+    }));
+  }
+
+  countSessionNotes(sessionId: string): number {
+    const row = this.db
+      .prepare("SELECT COUNT(*) AS c FROM session_notes WHERE session_id = ?")
+      .get(sessionId) as { c: number };
+    return row.c;
+  }
+
+  linkSessionSnapshot(sessionId: string, snapshotId: string, sealedAtMs: number): void {
+    this.db
+      .prepare(
+        "INSERT OR IGNORE INTO session_snapshots (session_id, snapshot_id, sealed_at_ms) VALUES (?, ?, ?)",
+      )
+      .run(sessionId, snapshotId, sealedAtMs);
+  }
+
+  listSessionSnapshotIds(sessionId: string): string[] {
+    const rows = this.db
+      .prepare(
+        "SELECT snapshot_id FROM session_snapshots WHERE session_id = ? ORDER BY sealed_at_ms ASC, snapshot_id ASC",
+      )
+      .all(sessionId) as Array<{ snapshot_id: string }>;
+    return rows.map((r) => r.snapshot_id);
   }
 }

@@ -7,11 +7,13 @@ import {
 } from "@replay/shared";
 import { SpanDetails } from "./components/SpanDetails.js";
 import { SpanList } from "./components/SpanList.js";
+import { SessionPanel } from "./components/SessionPanel.js";
 import { SnapshotPanel } from "./components/SnapshotPanel.js";
 import { Timeline } from "./components/Timeline.js";
 import { TopBar } from "./components/TopBar.js";
 import { Topology3D } from "./components/Topology3D.js";
 import { LiveConnection } from "./live.js";
+import { CollabClient, useCollab } from "./session.js";
 import { ReplayStore, useReplay, type Selection } from "./state.js";
 import type { TopologyScene } from "./three/scene.js";
 
@@ -37,14 +39,19 @@ function useMediaQuery(query: string): boolean {
 }
 
 export default function App(): React.JSX.Element {
-  const store = useMemo(() => new ReplayStore(), []);
+  const [store, live, collab] = useMemo(() => {
+    const s = new ReplayStore();
+    const l = new LiveConnection(s);
+    const c = new CollabClient(s, l);
+    return [s, l, c] as const;
+  }, []);
   const sceneRef = useRef<TopologyScene | null>(null);
+  const snapshotOpenRef = useRef<((id: string) => void) | null>(null);
 
   useEffect(() => {
-    const conn = new LiveConnection(store);
-    conn.start();
-    return () => conn.stop();
-  }, [store]);
+    live.start();
+    return () => live.stop();
+  }, [live]);
 
   useEffect(() => {
     (window as ReplayWindow).__replay = {
@@ -56,6 +63,7 @@ export default function App(): React.JSX.Element {
   }, [store]);
 
   const snap = useReplay(store);
+  const collabSnap = useCollab(collab);
   const view = useMemo(
     () => buildView(store.getEntries(), snap.cursor),
     [store, snap.version, snap.cursor],
@@ -132,7 +140,7 @@ export default function App(): React.JSX.Element {
 
   return (
     <div className="app">
-      <TopBar snap={snap} view={view} onToggleSnapshots={() => setDrawerOpen((v) => !v)} />
+      <TopBar snap={snap} view={view} collabRole={collabSnap.role} onToggleSnapshots={() => setDrawerOpen((v) => !v)} />
       <main className={`main${isNarrow ? " narrow" : ""}`}>
         <section className="panel topo-panel">
           <Topology3D
@@ -195,7 +203,16 @@ export default function App(): React.JSX.Element {
           store.select({ traceId, spanId });
           if (isNarrow) setSideTab("details");
         }}
-      />
+        onRegisterOpen={(open) => {
+          snapshotOpenRef.current = open;
+        }}
+      >
+        <SessionPanel
+          collab={collab}
+          replaySnap={snap}
+          onOpenSnapshot={(id) => snapshotOpenRef.current?.(id)}
+        />
+      </SnapshotPanel>
     </div>
   );
 }

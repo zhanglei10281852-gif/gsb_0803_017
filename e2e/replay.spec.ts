@@ -291,6 +291,134 @@ test("事故快照：封存 A/B 游标、差异与备注、迟到不改写已封
   await expect(page.locator('[data-testid^="snapshot-item-"]')).toHaveCount(2);
 });
 
+test("跨班协作：租约与 fencing、共同游标跟随、备注确定性归并、过期接管", async ({ browser }) => {
+  const ctxA = await browser.newContext();
+  const ctxB = await browser.newContext();
+  const pageA = await ctxA.newPage();
+  const pageB = await ctxB.newPage();
+  const total = expectations.head.totalEntries + 3;
+  const headSeq = expectations.head.cursor.ingestSequence + 3;
+  await waitAppReady(pageA, total);
+  await waitAppReady(pageB, total);
+
+  // 班组-A 以第一个封存快照为锚点发起会话
+  await pageA.getByTestId("snapshot-toggle").click();
+  await pageA.getByTestId("session-name-input").fill("班组-A");
+  const createBtn = pageA.locator('[data-testid^="session-create-"]').first();
+  await createBtn.click();
+  await expect(pageA.getByTestId("session-panel")).toBeVisible();
+  await expect(pageA.getByTestId("session-anchor")).toContainText("digest");
+  await expect(pageA.getByTestId("collab-role")).toHaveText("独立查看");
+
+  // 班组-B 加入同一会话
+  await pageB.getByTestId("snapshot-toggle").click();
+  await pageB.getByTestId("session-name-input").fill("班组-B");
+  const joinBtn = pageB.locator('[data-testid^="session-join-"]').first();
+  const joinTestId = (await joinBtn.getAttribute("data-testid")) ?? "";
+  const sessionId = joinTestId.replace("session-join-", "");
+  expect(sessionId).toMatch(/^ses-/);
+  await joinBtn.click();
+  await expect(pageB.getByTestId("collab-role")).toHaveText("独立查看");
+
+  // A 持租（3s 短租约，便于后续过期接管）→ 三态分明
+  await pageA.getByTestId("lease-ttl").fill("3");
+  await pageA.getByTestId("lease-acquire").click();
+  await expect(pageA.getByTestId("collab-role")).toHaveText("负责人（持有租约）");
+  await expect(pageA.getByTestId("fencing-token")).toHaveText("1");
+  await expect(pageB.getByTestId("collab-role")).toHaveText("跟随负责人");
+  await expect(pageB.getByTestId("push-cursor-btn")).toBeDisabled();
+
+  // A 推进共同游标 → B 自动跟随（WS 广播 + 共同游标应用）
+  await pageA.getByTestId("mode-toggle").click();
+  await pageA.getByTestId("ingest-slider").fill(String(headSeq - 50));
+  await pageA.getByTestId("push-cursor-btn").click();
+  await expect(pageA.getByTestId("shared-cursor-readout")).toContainText(`ingest=${headSeq - 50}`);
+  await expect(pageB.getByTestId("ingest-readout")).toContainText(`${headSeq - 50} /`);
+
+  // 无租约/假令牌的门控请求被服务端拒绝
+  const denied = await fetch(`${BASE}/api/sessions/${sessionId}/cursor`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      clientId: "intruder",
+      fencingToken: 999,
+      cursor: { contract: "replay-cursor/1", eventTime: 1, ingestSequence: 1 },
+    }),
+  });
+  expect(denied.status).toBe(409);
+
+  // A 在会话内封存（用上一步固定的游标区间）
+  await pageA.getByTestId("seal-a-btn").click();
+  await pageA.getByTestId("ingest-slider").fill(String(headSeq));
+  await pageA.getByTestId("seal-b-btn").click();
+  await pageA.getByTestId("session-seal-btn").click();
+  await expect(pageA.locator('[data-testid^="session-snapshot-"]')).toHaveCount(1);
+  await expect(pageB.locator('[data-testid^="session-snapshot-"]')).toHaveCount(1);
+
+  // 并发备注：晚 createdAtMs 的先到达、早 createdAtMs 的后到达 → 归并顺序不随到达顺序
+  const postNote = (clientId: string, author: string, text: string, noteId: string, createdAtMs: number) =>
+    fetch(`${BASE}/api/sessions/${sessionId}/notes`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ clientId, author, text, noteId, createdAtMs }),
+    });
+  await postNote("c-a", "班组-A", "晚到的备注", "n-z-late", 2000);
+  await postNote("c-b", "班组-B", "早先的备注", "n-a-early", 1000);
+  await expect(pageA.locator('[data-testid^="session-note-n-"]')).toHaveCount(2);
+  await expect(pageB.locator('[data-testid^="session-note-n-"]')).toHaveCount(2);
+  const firstA = await pageA.locator('[data-testid^="session-note-n-"]').first().textContent();
+  const firstB = await pageB.locator('[data-testid^="session-note-n-"]').first().textContent();
+  expect(firstA).toContain("早先的备注");
+  expect(firstB).toContain("早先的备注");
+  // 两端归并摘要一致且重复读取稳定
+  const digestA = await pageA.getByTestId("merge-digest").textContent();
+  const digestB = await pageB.getByTestId("merge-digest").textContent();
+  expect(digestA).toBe(digestB);
+  const s1 = (await (await fetch(`${BASE}/api/sessions/${sessionId}`)).json()) as { mergeDigest: string };
+  const s2 = (await (await fetch(`${BASE}/api/sessions/${sessionId}`)).json()) as { mergeDigest: string };
+  expect(s1.mergeDigest).toBe(s2.mergeDigest);
+
+  // B 通过 UI 再发一条（表单路径），两端同步可见
+  await pageB.getByTestId("session-note-input").fill("B 组补充：已联系支付渠道");
+  await pageB.getByTestId("session-note-submit").click();
+  await expect(pageA.locator('[data-testid^="session-note-n-"]')).toHaveCount(3);
+
+  // 租约过期 + 旧负责人掉线：A 关闭页面（心跳停止），B 接管为新负责人
+  const aClientId = ((await (
+    await fetch(`${BASE}/api/sessions/${sessionId}`)
+  ).json()) as { participants: Array<{ clientId: string; name: string }> }).participants.find(
+    (p) => p.name === "班组-A",
+  )?.clientId;
+  expect(aClientId).toBeTruthy();
+  await ctxA.close();
+  await pageB.waitForTimeout(3_600);
+  await pageB.getByTestId("lease-ttl").fill("30");
+  await pageB.getByTestId("lease-acquire").click();
+  await expect(pageB.getByTestId("collab-role")).toHaveText("负责人（持有租约）");
+  await expect(pageB.getByTestId("fencing-token")).toHaveText("2");
+
+  // 旧客户端晚到：A 的过期 token 不能覆盖新负责人，共同游标不变
+  const stale = await fetch(`${BASE}/api/sessions/${sessionId}/cursor`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      clientId: aClientId,
+      fencingToken: 1,
+      cursor: { contract: "replay-cursor/1", eventTime: 1, ingestSequence: 1 },
+    }),
+  });
+  expect(stale.status).toBe(409);
+  const staleBody = (await stale.json()) as { error: string };
+  expect(staleBody.error).toBe("stale-fencing-token");
+  const finalState = (await (
+    await fetch(`${BASE}/api/sessions/${sessionId}`)
+  ).json()) as { sharedCursor: { ingestSequence: number }; lease: { holderId: string } | null };
+  expect(finalState.sharedCursor.ingestSequence).toBe(headSeq - 50);
+  expect(finalState.lease?.holderId).not.toBe(aClientId);
+
+  await ctxB.close();
+});
+
 test("窄屏布局：tabs 切换完成选择、回放与游标操作", async ({ page }) => {
   await page.setViewportSize({ width: 480, height: 900 });
   // 前面用例已注入 3 条探针事件

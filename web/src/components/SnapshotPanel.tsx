@@ -22,6 +22,8 @@ export interface SnapshotPanelProps {
   store: ReplayStore;
   onClose(): void;
   onSelectSpan(traceId: string, spanId: string): void;
+  onRegisterOpen?(open: (id: string) => void): void;
+  children?: React.ReactNode;
 }
 
 const KIND_LABEL: Record<ChangeKind, string> = {
@@ -69,6 +71,11 @@ export function SnapshotPanel(props: SnapshotPanelProps): React.JSX.Element | nu
       setError(err instanceof Error ? err.message : String(err));
     }
   }, []);
+
+  useEffect(() => {
+    props.onRegisterOpen?.((id: string) => void openDetail(id));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [openDetail]);
 
   const onSeal = async (): Promise<void> => {
     if (!snap.sealA || !snap.sealB) return;
@@ -285,6 +292,7 @@ export function SnapshotPanel(props: SnapshotPanelProps): React.JSX.Element | nu
           </div>
         </div>
       )}
+      {props.children}
     </aside>
   );
 }

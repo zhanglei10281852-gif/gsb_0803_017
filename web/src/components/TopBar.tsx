@@ -1,10 +1,12 @@
 import type { ReplayViewV1 } from "@replay/shared";
 import { formatTime } from "../api.js";
+import { collabRoleLabel, type CollabRole } from "../session.js";
 import type { Snapshot } from "../state.js";
 
 export interface TopBarProps {
   snap: Snapshot;
   view: ReplayViewV1;
+  collabRole: CollabRole;
   onToggleSnapshots(): void;
 }
 
@@ -14,7 +16,7 @@ const CONNECTION_LABEL: Record<Snapshot["connection"], string> = {
   reconnecting: "重连中",
 };
 
-export function TopBar({ snap, view, onToggleSnapshots }: TopBarProps): React.JSX.Element {
+export function TopBar({ snap, view, collabRole, onToggleSnapshots }: TopBarProps): React.JSX.Element {
   return (
     <header className="topbar">
       <div className="topbar-title">链路事故回放平台</div>
@@ -23,6 +25,9 @@ export function TopBar({ snap, view, onToggleSnapshots }: TopBarProps): React.JS
       </span>
       <span className={`chip mode-${snap.mode}`} data-testid="mode-chip">
         {snap.mode === "live" ? "实时跟随" : "暂停回放"}
+      </span>
+      <span className={`chip collab-${collabRole}`} data-testid="collab-role">
+        {collabRoleLabel(collabRole)}
       </span>
       <button type="button" className="btn" data-testid="snapshot-toggle" onClick={onToggleSnapshots}>
         快照对比

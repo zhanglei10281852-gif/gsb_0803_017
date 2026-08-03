@@ -719,3 +719,123 @@ body {
   max-width: 90px;
   flex: none;
 }
+
+/* 协作会话 */
+.chip.collab-independent {
+  color: var(--muted);
+}
+
+.chip.collab-owner {
+  color: var(--ok);
+  border-color: var(--ok);
+}
+
+.chip.collab-follower {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+.chip.collab-stale {
+  color: var(--error);
+  border-color: var(--error);
+}
+
+.collab .section-title {
+  padding: 8px 0 4px;
+}
+
+.identity-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+
+.identity-input {
+  max-width: 140px;
+  flex: none;
+}
+
+.identity-id {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.session-line {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 5px 8px;
+  background: #0f172a;
+  border: 1px solid var(--panel-border);
+  border-radius: 6px;
+  margin-bottom: 5px;
+}
+
+.session-line-id {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+}
+
+.session-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+
+.session-anchor {
+  color: var(--accent);
+  font-size: 12px;
+}
+
+.lease-box,
+.shared-cursor-box {
+  background: #0f172a;
+  border: 1px solid var(--panel-border);
+  border-radius: 8px;
+  padding: 8px;
+  margin-bottom: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.lease-none {
+  color: var(--muted);
+}
+
+.lease-actions {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.ttl-input {
+  width: 64px;
+  flex: none;
+}
+
+.stale-banner {
+  padding: 6px 8px;
+  border: 1px solid var(--error);
+  border-radius: 6px;
+  color: #fecaca;
+  background: rgba(239, 68, 68, 0.12);
+}
+
+.participants {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.session-notes {
+  max-height: 220px;
+  overflow-y: auto;
+}

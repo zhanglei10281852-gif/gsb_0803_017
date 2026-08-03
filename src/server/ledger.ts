@@ -1,0 +1,437 @@
+import Database from 'better-sqlite3';
+import { mkdirSync } from 'node:fs';
+import { dirname } from 'node:path';
+import {
+  CONTRACT_VERSION,
+  type LedgerRecord,
+  type SpanEventInput,
+} from '../shared/contract';
+import { computeBounds, type LedgerBounds } from '../shared/projection';
+
+/**
+ * The append-only ledger. It is the single source of truth: every span
+ * revision that ever arrives is stored forever with a server-assigned,
+ * monotonically increasing `ingestSequence` (the SQLite AUTOINCREMENT rowid).
+ *
+ * Nothing is ever updated or deleted. Projections are derived on read, so the
+ * store survives process restarts with zero re-ingestion and any historical
+ * view remains reproducible.
+ */
+export class Ledger {
+  private readonly db: Database.Database;
+  private readonly insertStmt: Database.Statement;
+  private readonly existsStmt: Database.Statement;
+
+  constructor(dbPath: string) {
+    if (dbPath !== ':memory:') mkdirSync(dirname(dbPath), { recursive: true });
+    this.db = new Database(dbPath);
+    this.db.pragma('journal_mode = WAL');
+    this.db.pragma('synchronous = NORMAL');
+    this.db.pragma('foreign_keys = ON');
+    this.migrate();
+    // Prepared after migrate so the target table exists. Kept as fields so the
+    // hot ingest path reuses compiled statements.
+    this.existsStmt = this.db.prepare(
+      'SELECT 1 FROM ledger WHERE traceId = ? AND spanId = ? AND revision = ? LIMIT 1',
+    );
+    this.insertStmt = this.db.prepare(`
+      INSERT INTO ledger (
+        contractVersion, traceId, spanId, parentSpanId, service, operation,
+        revision, eventTimeMs, durationMs, status, revisionReason, errorKind, receivedAtMs
+      ) VALUES (
+        @contractVersion, @traceId, @spanId, @parentSpanId, @service, @operation,
+        @revision, @eventTimeMs, @durationMs, @status, @revisionReason, @errorKind, @receivedAtMs
+      )
+    `);
+  }
+
+  private migrate(): void {
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS meta (
+        key   TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+      );
+
+      -- Immutable append-only ledger. ingestSequence is AUTOINCREMENT so it is
+      -- strictly monotonic and never reused, even across restarts.
+      CREATE TABLE IF NOT EXISTS ledger (
+        ingestSequence INTEGER PRIMARY KEY AUTOINCREMENT,
+        contractVersion INTEGER NOT NULL,
+        traceId        TEXT    NOT NULL,
+        spanId         TEXT    NOT NULL,
+        parentSpanId   TEXT,
+        service        TEXT    NOT NULL,
+        operation      TEXT    NOT NULL,
+        revision       INTEGER NOT NULL,
+        eventTimeMs    INTEGER NOT NULL,
+        durationMs     INTEGER NOT NULL,
+        status         TEXT    NOT NULL,
+        revisionReason TEXT,
+        errorKind      TEXT,
+        receivedAtMs   INTEGER NOT NULL,
+        -- Idempotency key: an identical (trace,span,revision) re-send is a
+        -- duplicate and must NOT create a new ledger row.
+        UNIQUE (traceId, spanId, revision)
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_ledger_time ON ledger (eventTimeMs);
+      CREATE INDEX IF NOT EXISTS idx_ledger_span ON ledger (traceId, spanId, revision);
+
+      -- Immutable sealed snapshots. Rows are insert-only: once sealed, a
+      -- snapshot's cursor, note, frozen high-water and digest never change.
+      -- Late events can only produce NEW snapshots, never rewrite these.
+      CREATE TABLE IF NOT EXISTS snapshots (
+        id             INTEGER PRIMARY KEY AUTOINCREMENT,
+        contractVersion INTEGER NOT NULL,
+        label          TEXT    NOT NULL,
+        note           TEXT,
+        eventTimeMs    INTEGER NOT NULL,
+        ingestSequence INTEGER NOT NULL,
+        ledgerHighWater INTEGER NOT NULL,
+        digestAlgorithm TEXT   NOT NULL,
+        digest         TEXT    NOT NULL,
+        sealedAtMs     INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_snapshots_seq ON snapshots (id);
+
+      -- Cross-shift collaboration session, anchored to a sealed snapshot.
+      -- The lease + fencing token + shared cursor are columns on this single
+      -- row per session, so lease/ownership survives restart and reconnect.
+      CREATE TABLE IF NOT EXISTS sessions (
+        id               INTEGER PRIMARY KEY AUTOINCREMENT,
+        contractVersion  INTEGER NOT NULL,
+        label            TEXT    NOT NULL,
+        anchorSnapshotId INTEGER NOT NULL,
+        anchorDigest     TEXT    NOT NULL,
+        createdAtMs      INTEGER NOT NULL,
+        -- Lease (nullable holder means nobody holds it right now).
+        leaseHolder      TEXT,
+        leaseExpiresAtMs INTEGER,
+        leaseToken       INTEGER,
+        -- Monotonic highest fencing token ever minted for this session.
+        highestFencingToken INTEGER NOT NULL DEFAULT 0,
+        -- Shared cursor the owner drives; followers track it.
+        sharedEventTimeMs   INTEGER NOT NULL,
+        sharedIngestSequence INTEGER NOT NULL,
+        sharedCursorToken    INTEGER NOT NULL DEFAULT 0,
+        FOREIGN KEY (anchorSnapshotId) REFERENCES snapshots (id)
+      );
+
+      -- Investigation notes. Idempotent by (sessionId, noteId); merge order is
+      -- computed deterministically from (lamport, author, id) on read.
+      CREATE TABLE IF NOT EXISTS session_notes (
+        sessionId   INTEGER NOT NULL,
+        noteId      TEXT    NOT NULL,
+        author      TEXT    NOT NULL,
+        lamport     INTEGER NOT NULL,
+        body        TEXT    NOT NULL,
+        createdAtMs INTEGER NOT NULL,
+        PRIMARY KEY (sessionId, noteId),
+        FOREIGN KEY (sessionId) REFERENCES sessions (id)
+      );
+    `);
+
+    const existing = this.db
+      .prepare('SELECT value FROM meta WHERE key = ?')
+      .get('contractVersion') as { value: string } | undefined;
+    if (existing === undefined) {
+      this.db
+        .prepare('INSERT INTO meta (key, value) VALUES (?, ?)')
+        .run('contractVersion', String(CONTRACT_VERSION));
+    } else if (Number(existing.value) !== CONTRACT_VERSION) {
+      throw new Error(
+        `Ledger contract version ${existing.value} is incompatible with runtime ${CONTRACT_VERSION}`,
+      );
+    }
+  }
+
+  /**
+   * Append one event. Returns the assigned ingestSequence, or null when the
+   * exact (traceId, spanId, revision) already exists (idempotent duplicate).
+   */
+  append(event: SpanEventInput, receivedAtMs: number): LedgerRecord | null {
+    // Idempotency: an exact (traceId, spanId, revision) re-send is a duplicate.
+    // We check first (rather than INSERT OR IGNORE) so AUTOINCREMENT never
+    // advances on a rejected row, keeping ingestSequence contiguous.
+    const already = this.existsStmt.get(event.traceId, event.spanId, event.revision);
+    if (already !== undefined) return null;
+    const info = this.insertStmt.run({
+      contractVersion: event.contractVersion,
+      traceId: event.traceId,
+      spanId: event.spanId,
+      parentSpanId: event.parentSpanId,
+      service: event.service,
+      operation: event.operation,
+      revision: event.revision,
+      eventTimeMs: event.eventTimeMs,
+      durationMs: event.durationMs,
+      status: event.status,
+      revisionReason: event.revisionReason,
+      errorKind: event.errorKind,
+      receivedAtMs,
+    });
+    if (info.changes === 0) return null; // defensive; should not happen
+    const ingestSequence = Number(info.lastInsertRowid);
+    return { ...event, ingestSequence, receivedAtMs };
+  }
+
+  /** Append a batch atomically. Returns accepted records and duplicate count. */
+  appendBatch(
+    events: readonly SpanEventInput[],
+    receivedAtMs: number,
+  ): { accepted: LedgerRecord[]; duplicates: number } {
+    const accepted: LedgerRecord[] = [];
+    let duplicates = 0;
+    const tx = this.db.transaction((batch: readonly SpanEventInput[]) => {
+      for (const ev of batch) {
+        const rec = this.append(ev, receivedAtMs);
+        if (rec === null) duplicates += 1;
+        else accepted.push(rec);
+      }
+    });
+    tx(events);
+    return { accepted, duplicates };
+  }
+
+  /** Read the entire immutable ledger, ordered by ingestSequence. */
+  readAll(): LedgerRecord[] {
+    const rows = this.db
+      .prepare('SELECT * FROM ledger ORDER BY ingestSequence ASC')
+      .all() as RawRow[];
+    return rows.map(rowToRecord);
+  }
+
+  /**
+   * Read only the records needed to reproduce a view: everything with
+   * ingestSequence <= the cursor's ingestSequence. eventTime filtering happens
+   * in the pure projection so a single query serves any timeline scrub.
+   */
+  readUpToIngest(maxIngestSequence: number): LedgerRecord[] {
+    const rows = this.db
+      .prepare('SELECT * FROM ledger WHERE ingestSequence <= ? ORDER BY ingestSequence ASC')
+      .all(maxIngestSequence) as RawRow[];
+    return rows.map(rowToRecord);
+  }
+
+  bounds(): LedgerBounds {
+    const row = this.db
+      .prepare(
+        `SELECT
+           COALESCE(MIN(eventTimeMs), 0)      AS minEventTimeMs,
+           COALESCE(MAX(eventTimeMs), 0)      AS maxEventTimeMs,
+           COALESCE(MAX(ingestSequence), 0)   AS maxIngestSequence
+         FROM ledger`,
+      )
+      .get() as LedgerBounds;
+    return row;
+  }
+
+  count(): number {
+    const row = this.db.prepare('SELECT COUNT(*) AS n FROM ledger').get() as { n: number };
+    return row.n;
+  }
+
+  // --- Immutable snapshots (same store, insert-only) ---
+
+  /**
+   * Insert a sealed snapshot. Insert-only: there is no update path, so an
+   * existing snapshot can never be rewritten. Returns the assigned id.
+   */
+  insertSnapshot(row: SnapshotInsert): number {
+    const info = this.db
+      .prepare(
+        `INSERT INTO snapshots (
+           contractVersion, label, note, eventTimeMs, ingestSequence,
+           ledgerHighWater, digestAlgorithm, digest, sealedAtMs
+         ) VALUES (
+           @contractVersion, @label, @note, @eventTimeMs, @ingestSequence,
+           @ledgerHighWater, @digestAlgorithm, @digest, @sealedAtMs
+         )`,
+      )
+      .run(row);
+    return Number(info.lastInsertRowid);
+  }
+
+  getSnapshot(id: number): SnapshotRow | null {
+    const row = this.db.prepare('SELECT * FROM snapshots WHERE id = ?').get(id) as
+      | SnapshotRow
+      | undefined;
+    return row ?? null;
+  }
+
+  listSnapshots(): SnapshotRow[] {
+    return this.db.prepare('SELECT * FROM snapshots ORDER BY id ASC').all() as SnapshotRow[];
+  }
+
+  // --- Collaboration sessions (same store; lease/fencing/notes persisted) ---
+
+  insertSession(row: SessionInsert): number {
+    const info = this.db
+      .prepare(
+        `INSERT INTO sessions (
+           contractVersion, label, anchorSnapshotId, anchorDigest, createdAtMs,
+           leaseHolder, leaseExpiresAtMs, leaseToken, highestFencingToken,
+           sharedEventTimeMs, sharedIngestSequence, sharedCursorToken
+         ) VALUES (
+           @contractVersion, @label, @anchorSnapshotId, @anchorDigest, @createdAtMs,
+           NULL, NULL, NULL, 0,
+           @sharedEventTimeMs, @sharedIngestSequence, 0
+         )`,
+      )
+      .run(row);
+    return Number(info.lastInsertRowid);
+  }
+
+  getSession(id: number): SessionRow | null {
+    const row = this.db.prepare('SELECT * FROM sessions WHERE id = ?').get(id) as
+      | SessionRow
+      | undefined;
+    return row ?? null;
+  }
+
+  /**
+   * Persist lease + shared-cursor state for a session. Called inside a
+   * transaction by the collaboration service so a grant and its fencing-token
+   * bump land atomically.
+   */
+  updateSessionState(row: {
+    id: number;
+    leaseHolder: string | null;
+    leaseExpiresAtMs: number | null;
+    leaseToken: number | null;
+    highestFencingToken: number;
+    sharedEventTimeMs: number;
+    sharedIngestSequence: number;
+    sharedCursorToken: number;
+  }): void {
+    this.db
+      .prepare(
+        `UPDATE sessions SET
+           leaseHolder = @leaseHolder,
+           leaseExpiresAtMs = @leaseExpiresAtMs,
+           leaseToken = @leaseToken,
+           highestFencingToken = @highestFencingToken,
+           sharedEventTimeMs = @sharedEventTimeMs,
+           sharedIngestSequence = @sharedIngestSequence,
+           sharedCursorToken = @sharedCursorToken
+         WHERE id = @id`,
+      )
+      .run(row);
+  }
+
+  /** Idempotent note insert: same (sessionId, noteId) is ignored on re-send. */
+  insertNote(row: NoteRow): void {
+    this.db
+      .prepare(
+        `INSERT OR IGNORE INTO session_notes (
+           sessionId, noteId, author, lamport, body, createdAtMs
+         ) VALUES (@sessionId, @noteId, @author, @lamport, @body, @createdAtMs)`,
+      )
+      .run(row);
+  }
+
+  listNotes(sessionId: number): NoteRow[] {
+    return this.db
+      .prepare('SELECT * FROM session_notes WHERE sessionId = ?')
+      .all(sessionId) as NoteRow[];
+  }
+
+  /** Run a function inside a single write transaction (for atomic lease ops). */
+  transaction<T>(fn: () => T): T {
+    return this.db.transaction(fn)();
+  }
+
+  close(): void {
+    this.db.close();
+  }
+}
+
+export interface SessionInsert {
+  contractVersion: number;
+  label: string;
+  anchorSnapshotId: number;
+  anchorDigest: string;
+  createdAtMs: number;
+  sharedEventTimeMs: number;
+  sharedIngestSequence: number;
+}
+
+export interface SessionRow {
+  id: number;
+  contractVersion: number;
+  label: string;
+  anchorSnapshotId: number;
+  anchorDigest: string;
+  createdAtMs: number;
+  leaseHolder: string | null;
+  leaseExpiresAtMs: number | null;
+  leaseToken: number | null;
+  highestFencingToken: number;
+  sharedEventTimeMs: number;
+  sharedIngestSequence: number;
+  sharedCursorToken: number;
+}
+
+export interface NoteRow {
+  sessionId: number;
+  noteId: string;
+  author: string;
+  lamport: number;
+  body: string;
+  createdAtMs: number;
+}
+
+export interface SnapshotInsert {
+  contractVersion: number;
+  label: string;
+  note: string | null;
+  eventTimeMs: number;
+  ingestSequence: number;
+  ledgerHighWater: number;
+  digestAlgorithm: string;
+  digest: string;
+  sealedAtMs: number;
+}
+
+export interface SnapshotRow extends SnapshotInsert {
+  id: number;
+}
+
+interface RawRow {
+  ingestSequence: number;
+  contractVersion: number;
+  traceId: string;
+  spanId: string;
+  parentSpanId: string | null;
+  service: string;
+  operation: string;
+  revision: number;
+  eventTimeMs: number;
+  durationMs: number;
+  status: string;
+  revisionReason: string | null;
+  errorKind: string | null;
+  receivedAtMs: number;
+}
+
+function rowToRecord(row: RawRow): LedgerRecord {
+  return {
+    contractVersion: CONTRACT_VERSION,
+    ingestSequence: row.ingestSequence,
+    traceId: row.traceId,
+    spanId: row.spanId,
+    parentSpanId: row.parentSpanId,
+    service: row.service,
+    operation: row.operation,
+    revision: row.revision,
+    eventTimeMs: row.eventTimeMs,
+    durationMs: row.durationMs,
+    status: row.status === 'error' ? 'error' : 'ok',
+    revisionReason: row.revisionReason,
+    errorKind: row.errorKind,
+    receivedAtMs: row.receivedAtMs,
+  };
+}
+
+// Re-export for callers that build bounds from an in-memory record slice.
+export { computeBounds };
